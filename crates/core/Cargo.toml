@@ -1,0 +1,26 @@
+[package]
+name = "zingolib-tui-core"
+description = "Wallet model and zingolib backend for the zingolib terminal wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zingolib = { workspace = true }
+pepper-sync = { workspace = true }
+zingo-netutils = { workspace = true }
+zingo-status = { workspace = true }
+zip32 = { workspace = true }
+bip0039 = { workspace = true }
+zip321 = { workspace = true }
+zcash_protocol = { workspace = true }
+zcash_address = { workspace = true }
+
+http = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

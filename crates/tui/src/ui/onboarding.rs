@@ -1,0 +1,751 @@
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Paragraph};
+
+use super::{dither, edged, inset, separator, sigil};
+use zingolib_tui_core::app::onboarding::{
+    check_ufvk, fresh_birthday, height_for_date, parse_birthday, parse_date,
+};
+use zingolib_tui_core::app::{
+    BirthdayMode, KeyMaterial, MenuItem, Onboarding, State, Step, WalletEntry, WalletKind,
+};
+use zingolib_tui_core::chain;
+use zingolib_tui_core::format;
+use crate::theme::Theme;
+
+enum Piece {
+    Lines(Vec<Line<'static>>),
+    Field(String),
+    Sigil(String),
+}
+
+fn legend(t: &Theme, pairs: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (key, what)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, t.accent));
+        spans.push(Span::styled(format!(" {what}"), t.muted));
+    }
+    Line::from(spans)
+}
+
+fn prompt(t: &Theme, text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("@ ", t.accent),
+        Span::styled(text.to_string(), t.text.add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn para(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(Line::styled(std::mem::take(&mut cur), style));
+            cur = word.to_string();
+        }
+    }
+    lines.push(Line::styled(cur, style));
+    lines
+}
+
+fn choices(t: &Theme, rows: Vec<(String, String)>, selected: usize) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, (label, detail))| {
+            let chosen = i == selected;
+            Line::from(vec![
+                if chosen {
+                    Span::styled("> ", t.accent)
+                } else {
+                    Span::raw("  ")
+                },
+                Span::styled(
+                    format!("{label:<30}"),
+                    if chosen { t.title } else { t.text },
+                ),
+                Span::styled(detail, t.muted),
+            ])
+        })
+        .collect()
+}
+
+fn blank() -> Line<'static> {
+    Line::from("")
+}
+
+pub fn age(secs: Option<u64>) -> String {
+    match secs {
+        None => "—".into(),
+        Some(s) if s < 60 => "just now".into(),
+        Some(s) if s < 3600 => format!("{} min ago", s / 60),
+        Some(s) if s < 86_400 => format!("{} h ago", s / 3600),
+        Some(s) => format!("{} d ago", s / 86_400),
+    }
+}
+
+fn heading(o: &Onboarding) -> (&'static str, String) {
+    let branch_steps = |first: usize, total: usize| format!("step {first} of {total}");
+    match o.step {
+        Step::Wallets => (
+            "wallets",
+            match o.wallets.len() {
+                0 => String::new(),
+                1 => "1 wallet".into(),
+                n => format!("{n} wallets"),
+            },
+        ),
+        Step::Menu => ("new wallet", String::new()),
+        Step::Create => ("new wallet", branch_steps(1, 2)),
+        Step::Restore => ("restore from seed", branch_steps(1, 3)),
+        Step::Watch => ("new watch-only wallet", branch_steps(1, 3)),
+        Step::Birthday => (
+            if o.is_watch() {
+                "new watch-only wallet"
+            } else {
+                "restore from seed"
+            },
+            branch_steps(2, 3),
+        ),
+        Step::Name => {
+            if o.seed.is_some() && !o.is_watch() {
+                ("new wallet", branch_steps(2, 2))
+            } else if o.is_watch() {
+                ("new watch-only wallet", branch_steps(3, 3))
+            } else {
+                ("restore from seed", branch_steps(3, 3))
+            }
+        }
+    }
+}
+
+fn footer(o: &Onboarding, t: &Theme) -> (Line<'static>, Line<'static>) {
+    let keys: Vec<(&'static str, &'static str)> = match o.step {
+        Step::Wallets => vec![
+            ("j k", "move"),
+            ("Enter", "open"),
+            ("n", "new"),
+            ("q", "quit"),
+        ],
+        Step::Menu => vec![
+            ("j k", "move"),
+            ("1 2 3", "jump"),
+            ("Enter", "choose"),
+            ("Esc", if o.wallets.is_empty() { "quit" } else { "back" }),
+        ],
+        Step::Create => vec![
+            ("Enter", "create"),
+            ("r", if o.seed_line { "grid" } else { "one line" }),
+            ("y", "copy birthday"),
+            ("Esc", "back"),
+        ],
+        Step::Restore => vec![
+            ("Enter", "continue"),
+            ("Backspace", "remove"),
+            (
+                "Esc",
+                if o.words.is_empty() && o.draft.is_empty() {
+                    "back"
+                } else {
+                    "clear"
+                },
+            ),
+        ],
+        Step::Watch => vec![
+            ("Enter", "continue"),
+            ("Esc", if o.key.is_empty() { "back" } else { "clear" }),
+        ],
+        Step::Birthday => match o.birthday_mode {
+            None => vec![
+                ("j k", "move"),
+                ("1-4", "jump"),
+                ("Enter", "choose"),
+                ("Esc", "back"),
+            ],
+            Some(BirthdayMode::Unknown) => vec![("y", "scan everything"), ("n", "choose again")],
+            Some(_) => vec![("Enter", "continue"), ("Esc", "choose again")],
+        },
+        Step::Name => vec![("Enter", "create"), ("Esc", "back")],
+    };
+    let mut status = Vec::new();
+    if let Some(tip) = o.tip {
+        status.push(Span::styled("T:", t.muted));
+        status.push(Span::styled(format::group(u64::from(tip.height)), t.text));
+        status.push(Span::raw("  "));
+    } else if o.tip_error.is_some() {
+        status.push(Span::styled("T:none", t.warning));
+        status.push(Span::raw("  "));
+    }
+    status.push(Span::styled(chain::CHAIN_LABEL, t.muted));
+    (legend(t, &keys), Line::from(status))
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, state: &State, t: &Theme, o: &Onboarding) {
+    let (what, right) = heading(o);
+    let header = edged(Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("zingolib-tui", t.title),
+            Span::styled(format!("   {what}"), t.text),
+        ])),
+        header,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(right, t.muted)).alignment(Alignment::Right),
+        header,
+    );
+    separator(
+        frame,
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
+        t,
+    );
+    let (keys, status) = footer(o, t);
+    let last = edged(Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    });
+    let status_width = u16::try_from(status.width()).unwrap_or(0);
+    frame.render_widget(
+        Paragraph::new(keys),
+        Rect {
+            width: last.width.saturating_sub(status_width + 2),
+            ..last
+        },
+    );
+    frame.render_widget(Paragraph::new(status).alignment(Alignment::Right), last);
+    let body_area = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(4),
+        ..area
+    };
+    let body = inset(body_area);
+    let width = usize::from(body.width);
+    let pieces = match o.step {
+        Step::Wallets => wallets(o, t),
+        Step::Menu => menu(o, t, width),
+        Step::Create => create(o, t, width),
+        Step::Restore => restore(o, t, width),
+        Step::Watch => watch(o, t, width),
+        Step::Birthday => birthday(o, t, width),
+        Step::Name => name(o, t, width),
+    };
+    let used = draw_pieces(frame, body, t, pieces);
+    if let Some(err) = &o.error {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                err.clone(),
+                t.negative.add_modifier(Modifier::BOLD),
+            )),
+            edged(Rect {
+                y: area.y + area.height - 2,
+                height: 1,
+                ..area
+            }),
+        );
+    }
+    if body.height.saturating_sub(used) >= 5 {
+        dither::band(frame, body, state, t);
+    }
+}
+
+fn draw_pieces(frame: &mut Frame, area: Rect, t: &Theme, pieces: Vec<Piece>) -> u16 {
+    let mut y = area.y;
+    let bottom = area.y + area.height;
+    for piece in pieces {
+        if y >= bottom {
+            break;
+        }
+        let room = Rect {
+            y,
+            height: bottom - y,
+            ..area
+        };
+        let used = match piece {
+            Piece::Lines(lines) => {
+                let n = u16::try_from(lines.len())
+                    .unwrap_or(u16::MAX)
+                    .min(room.height);
+                frame.render_widget(Paragraph::new(lines), room);
+                n
+            }
+            Piece::Field(value) => {
+                let inner_width = usize::from(area.width.saturating_sub(4)).max(1);
+                let rows = format::wrap_chars(&value, inner_width);
+                let height = (u16::try_from(rows.len()).unwrap_or(1) + 2).min(room.height);
+                let rect = Rect { height, ..room };
+                let block = Block::bordered()
+                    .border_type(BorderType::Double)
+                    .border_style(t.accent);
+                let inner = block.inner(rect);
+                frame.render_widget(block, rect);
+                let last = rows.len().saturating_sub(1);
+                let lines: Vec<Line<'static>> = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let mut spans = vec![Span::raw(" "), Span::styled(row, t.text)];
+                        if i == last {
+                            spans.push(Span::styled(" ", t.cursor));
+                        }
+                        Line::from(spans)
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(lines), inner);
+                height
+            }
+            Piece::Sigil(material) => {
+                sigil::draw(frame, room, t, &material);
+                sigil::HEIGHT.min(room.height)
+            }
+        };
+        y += used;
+    }
+    y - area.y
+}
+
+fn wallets(o: &Onboarding, t: &Theme) -> Vec<Piece> {
+    let mut lines = Vec::new();
+    if !o.listed {
+        lines.push(Line::styled("Reading the data directory…", t.muted));
+        return vec![Piece::Lines(lines)];
+    }
+    lines.push(prompt(t, "open a wallet, or make a new one:"));
+    lines.push(blank());
+    const GAP: usize = 4;
+    let width_of = |header: &str, cells: &mut dyn Iterator<Item = usize>| {
+        cells
+            .chain(std::iter::once(header.chars().count()))
+            .max()
+            .unwrap_or(0)
+            + GAP
+    };
+    let name_w = width_of(
+        "name",
+        &mut o.wallets.iter().map(|w| w.name.chars().count()),
+    );
+    let kind_w = width_of("kind", &mut o.wallets.iter().map(|w| w.kind.name().len()));
+    let birthday_of = |w: &WalletEntry| {
+        w.birthday
+            .map_or("—".to_string(), |b| format::group(u64::from(b)))
+    };
+    let birthday_w = width_of(
+        "birthday",
+        &mut o.wallets.iter().map(|w| birthday_of(w).chars().count()),
+    );
+    lines.push(Line::styled(
+        format!(
+            "  {:<name_w$}{:<kind_w$}{:<birthday_w$}{}",
+            "name", "kind", "birthday", "last written"
+        ),
+        t.muted,
+    ));
+    for (i, w) in o.wallets.iter().enumerate() {
+        let chosen = i == o.wallet_sel;
+        lines.push(Line::from(vec![
+            if chosen {
+                Span::styled("> ", t.accent)
+            } else {
+                Span::raw("  ")
+            },
+            Span::styled(
+                format!("{:<name_w$}", w.name),
+                if chosen { t.title } else { t.text },
+            ),
+            Span::styled(
+                format!("{:<kind_w$}", w.kind.name()),
+                match w.kind {
+                    WalletKind::Seed => t.accent,
+                    WalletKind::Watch => t.info,
+                    WalletKind::Unknown => t.muted,
+                },
+            ),
+            Span::styled(format!("{:<birthday_w$}", birthday_of(w)), t.text),
+            Span::styled(age(w.age_secs), t.muted),
+        ]));
+    }
+    let chosen = o.wallet_sel == o.wallets.len();
+    lines.push(Line::from(vec![
+        if chosen {
+            Span::styled("> ", t.accent)
+        } else {
+            Span::raw("  ")
+        },
+        Span::styled("New wallet…", if chosen { t.title } else { t.muted }),
+    ]));
+    let mut pieces = vec![Piece::Lines(lines)];
+    if let Some(w) = o.wallets.get(o.wallet_sel) {
+        pieces.push(Piece::Lines(vec![blank()]));
+        pieces.push(Piece::Sigil(w.name.clone()));
+    }
+    pieces
+}
+
+fn menu(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let mut lines = vec![prompt(
+        t,
+        if o.wallets.is_empty() {
+            "no wallet yet. what would you like to do?"
+        } else {
+            "what would you like to do?"
+        },
+    )];
+    lines.extend(para(
+        "You can also paste a seed phrase or a viewing key here.",
+        t.muted,
+        width,
+    ));
+    lines.push(blank());
+    lines.extend(choices(
+        t,
+        MenuItem::ALL
+            .iter()
+            .map(|m| (m.label().to_string(), m.detail().to_string()))
+            .collect(),
+        o.menu_sel,
+    ));
+    lines.push(blank());
+    lines.push(Line::from(vec![
+        Span::styled("Chain: ", t.muted),
+        Span::styled(chain::CHAIN_LABEL, t.text),
+        Span::styled(".", t.muted),
+    ]));
+    vec![Piece::Lines(lines)]
+}
+
+fn word_grid(
+    t: &Theme,
+    words: &[Option<String>],
+    width: usize,
+    draft_at: Option<usize>,
+) -> Vec<Line<'static>> {
+    let cols = (width / 15).clamp(2, 4);
+    words
+        .chunks(cols)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let mut spans = Vec::new();
+            for (i, word) in chunk.iter().enumerate() {
+                let n = row * cols + i;
+                spans.push(Span::styled(format!("{:>2} ", n + 1), t.muted));
+                match word {
+                    Some(w) => spans.push(Span::styled(
+                        format!("{w:<11}"),
+                        if draft_at == Some(n) { t.muted } else { t.text },
+                    )),
+                    None => spans.push(Span::styled(format!("{:<11}", "·"), t.border)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn create(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let mut lines = vec![prompt(t, "your seed phrase. write it down.")];
+    lines.extend(para(
+        "The only backup. Anyone holding it can spend. Keep the birthday with it.",
+        t.muted,
+        width,
+    ));
+    lines.push(blank());
+    match &o.seed {
+        None => lines.push(Line::styled("Generating…", t.muted)),
+        Some(seed) if o.seed_line => lines.extend(para(seed, t.text, width)),
+        Some(seed) => {
+            let words: Vec<Option<String>> = seed.split(' ').map(|w| Some(w.to_string())).collect();
+            lines.extend(word_grid(t, &words, width, None));
+        }
+    }
+    lines.push(blank());
+    pieces.push(Piece::Lines(lines));
+    match o.tip {
+        Some(tip) => {
+            let birthday = fresh_birthday(&tip);
+            pieces.push(Piece::Lines(vec![Line::from(vec![
+                Span::styled("birthday ", t.muted),
+                Span::styled(format::group(u64::from(birthday)), t.title),
+                Span::styled(format!("  on {}", chain::CHAIN_LABEL), t.muted),
+            ])]));
+        }
+        None => pieces.push(Piece::Lines(match &o.tip_error {
+            Some(e) => para(
+                &format!(
+                    "The birthday needs the chain tip, and the server did not answer: {e}. R tries again."
+                ),
+                t.warning,
+                width,
+            ),
+            None => para(
+                &format!(
+                    "Asking {} for the chain tip, which sets the birthday…",
+                    o.server
+                        .clone()
+                        .unwrap_or_else(|| "the default indexer".to_string())
+                ),
+                t.muted,
+                width,
+            ),
+        })),
+    }
+    if let Some(seed) = &o.seed {
+        pieces.push(Piece::Lines(vec![blank()]));
+        pieces.push(Piece::Sigil(seed.clone()));
+    }
+    pieces
+}
+
+fn restore(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let mut lines = vec![prompt(t, "speak the seed phrase:")];
+    lines.extend(para(
+        "Type or paste it. Space ends a word. A number after the words is read as the birthday, the way the app copies both.",
+        t.muted,
+        width,
+    ));
+    lines.push(blank());
+    let mut words: Vec<Option<String>> = o.words.iter().cloned().map(Some).collect();
+    let draft_at = (!o.draft.is_empty() && words.len() < 24).then_some(words.len());
+    if draft_at.is_some() {
+        words.push(Some(o.draft.clone()));
+    }
+    words.resize(24, None);
+    lines.extend(word_grid(t, &words, width, draft_at));
+    lines.push(blank());
+    let count = o.words.len();
+    let complete = [12, 15, 18, 21, 24].contains(&count);
+    let mut status = vec![Span::styled(
+        format!("{count} of 24 words"),
+        if complete { t.positive } else { t.muted },
+    )];
+    if let Some(hint) = o.birthday_hint {
+        status.push(Span::styled(
+            format!(
+                ", birthday {} from the paste",
+                format::group(u64::from(hint))
+            ),
+            t.muted,
+        ));
+    }
+    lines.push(Line::from(status));
+    vec![Piece::Lines(lines)]
+}
+
+fn watch(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let mut intro = vec![prompt(t, "paste the viewing key:")];
+    intro.extend(para(
+        "From the app: settings › viewing key. The key alone, or the key and the birthday. Nothing is sent anywhere.",
+        t.muted,
+        width,
+    ));
+    intro.push(blank());
+    let mut pieces = vec![Piece::Lines(intro), Piece::Field(o.key.clone())];
+    let mut parts = o.key.split_whitespace();
+    if let Some(first) = parts.next() {
+        let mut lines = vec![blank()];
+        match check_ufvk(first) {
+            Ok(()) => {
+                let hint = parts.next().and_then(|n| n.parse::<u32>().ok());
+                lines.push(Line::styled(
+                    "viewing key for the Zcash main chain",
+                    t.positive,
+                ));
+                lines.extend(para(
+                    &match hint {
+                        Some(h) => {
+                            format!("birthday {} from the paste", format::group(u64::from(h)))
+                        }
+                        None => "no birthday in the paste: the next step asks".to_string(),
+                    },
+                    t.muted,
+                    width,
+                ));
+                lines.push(blank());
+                pieces.push(Piece::Lines(lines));
+                pieces.push(Piece::Sigil(first.to_string()));
+            }
+            Err(e) => {
+                lines.extend(para(&e, t.warning, width));
+                pieces.push(Piece::Lines(lines));
+            }
+        }
+    }
+    pieces
+}
+
+fn birthday(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let floor = chain::sapling_activation();
+    let Some(mode) = o.birthday_mode else {
+        let mut lines = vec![prompt(t, "when was the wallet created?")];
+        lines.extend(para(
+            "Blocks before its birthday are never scanned. Too late hides old funds; too early makes the first sync slow.",
+            t.muted,
+            width,
+        ));
+        lines.push(blank());
+        lines.extend(choices(
+            t,
+            vec![
+                (
+                    "paste it from the app".into(),
+                    match o.birthday_hint {
+                        Some(h) => format!("found {}", format::group(u64::from(h))),
+                        None => "settings › viewing key › tap the birthday".into(),
+                    },
+                ),
+                ("I know the block height".into(), String::new()),
+                ("I know roughly the date".into(), String::new()),
+                (
+                    "I don't know".into(),
+                    format!(
+                        "scan from {}, where Sapling activated",
+                        format::group(u64::from(floor))
+                    ),
+                ),
+            ],
+            o.birthday_sel,
+        ));
+        return vec![Piece::Lines(lines)];
+    };
+    if mode == BirthdayMode::Unknown {
+        let blocks = o.tip.map(|tip| tip.height.saturating_sub(floor));
+        let mut lines = vec![prompt(t, "scan the whole chain?")];
+        lines.extend(para(
+            &format!(
+                "From block {}{}. The wallet is usable only once the scan finishes, which can take hours.",
+                format::group(u64::from(floor)),
+                blocks.map_or(String::new(), |b| format!(
+                    ", {} blocks",
+                    format::group(u64::from(b))
+                ))
+            ),
+            t.muted,
+            width,
+        ));
+        lines.extend(para(
+            "New to this wallet? \"I know roughly the date\" is faster and safe.",
+            t.muted,
+            width,
+        ));
+        return vec![Piece::Lines(lines)];
+    }
+    let mut intro = vec![prompt(
+        t,
+        match mode {
+            BirthdayMode::FromApp => "paste the birthday from the app:",
+            BirthdayMode::Height => "at which block height was the wallet created?",
+            _ => "around which date was the wallet created?",
+        },
+    )];
+    intro.extend(para(
+        &match mode {
+            BirthdayMode::FromApp => {
+                "In the app, tap the birthday under the viewing key to copy it.".to_string()
+            }
+            BirthdayMode::Height => format!(
+                "A number between {} and the chain tip.",
+                format::group(u64::from(floor))
+            ),
+            _ => "YYYY-MM or YYYY-MM-DD. The birthday is placed two weeks before it, for safety."
+                .to_string(),
+        },
+        t.muted,
+        width,
+    ));
+    intro.push(blank());
+    let mut pieces = vec![Piece::Lines(intro), Piece::Field(o.birthday_input.clone())];
+    let mut lines = vec![blank()];
+    if !o.birthday_input.trim().is_empty() {
+        match parse_birthday(o, mode) {
+            Ok(height) => {
+                let mut spans = vec![Span::styled(
+                    format!("Height {}", format::group(u64::from(height))),
+                    t.positive,
+                )];
+                if let Some(tip) = o.tip {
+                    spans.push(Span::styled(
+                        format!(
+                            ", {} blocks to scan up to the tip at {}",
+                            format::group(u64::from(tip.height.saturating_sub(height))),
+                            format::group(u64::from(tip.height))
+                        ),
+                        t.muted,
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            Err(e) => lines.extend(para(&e, t.warning, width)),
+        }
+    } else if mode == BirthdayMode::Date
+        && let Some(tip) = o.tip
+        && let Some(h) = parse_date("2025-01-01")
+            .ok()
+            .and_then(|d| height_for_date(tip, d))
+    {
+        lines.push(Line::styled(
+            format!(
+                "For example, 2025-01-01 gives height {}.",
+                format::group(u64::from(h))
+            ),
+            t.muted,
+        ));
+    }
+    pieces.push(Piece::Lines(lines));
+    pieces
+}
+
+fn name(o: &Onboarding, t: &Theme, width: usize) -> Vec<Piece> {
+    let mut intro = vec![prompt(t, "name the wallet:")];
+    intro.extend(para(
+        &format!(
+            "A mainnet {} wallet with birthday {}. The name becomes the file name, <name>.dat, in the data directory.",
+            if o.is_watch() { "watch-only" } else { "seed" },
+            o.birthday
+                .map_or("—".to_string(), |b| format::group(u64::from(b)))
+        ),
+        t.muted,
+        width,
+    ));
+    intro.push(blank());
+    let mut pieces = vec![Piece::Lines(intro), Piece::Field(o.name.clone())];
+    let mut lines = Vec::new();
+    if !o.wallets.is_empty() {
+        lines.push(blank());
+        lines.extend(para(
+            &format!(
+                "In use: {}.",
+                o.wallets
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            t.muted,
+            width,
+        ));
+    }
+    lines.push(blank());
+    pieces.push(Piece::Lines(lines));
+    if let Some(material) = &o.material {
+        let key = match material {
+            KeyMaterial::Seed(s) => s.clone(),
+            KeyMaterial::Ufvk(k) => k.clone(),
+        };
+        pieces.push(Piece::Sigil(key));
+    }
+    pieces
+}

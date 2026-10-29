@@ -1,0 +1,41 @@
+[workspace]
+members = ["crates/core", "crates/tui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+zingolib-tui-core = { path = "crates/core" }
+
+zingolib = { git = "https://github.com/zingolabs/zingolib", rev = "417ba54a51a15ad28e7374a0f938fe783961d059", features = [
+    "perspective",
+] }
+pepper-sync = { git = "https://github.com/zingolabs/zingolib", rev = "417ba54a51a15ad28e7374a0f938fe783961d059" }
+zingo-netutils = { git = "https://github.com/zingolabs/zingolib", rev = "417ba54a51a15ad28e7374a0f938fe783961d059" }
+zingo-status = { git = "https://github.com/zingolabs/zingolib", rev = "417ba54a51a15ad28e7374a0f938fe783961d059" }
+
+bip0039 = { version = "0.14", features = ["rand"] }
+zip32 = "0.3"
+zip321 = "0.10"
+zcash_protocol = "=0.11.0"
+zcash_address = "=0.14.0"
+
+ratatui = "0.30"
+crossterm = "0.29"
+qrcode = { version = "0.14", default-features = false }
+
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+dirs = "6"
+http = "1"
+rustls = { version = "0.23", features = ["ring"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+
+[profile.test]
+opt-level = 3
