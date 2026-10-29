@@ -15,8 +15,8 @@ const TEXT_MAX: u16 = 48;
 pub fn draw(frame: &mut Frame, area: Rect, state: &State, t: &Theme) {
     let Some(address) = state.receive_address() else {
         let msg = match state.receive_kind {
-            ReceiveKind::Unified => "No unified address yet. Press n to make one.",
-            ReceiveKind::Transparent => "No transparent address yet. Press n to make one.",
+            ReceiveKind::Unified => "No unified address yet. Press n to create one.",
+            ReceiveKind::Transparent => "No transparent address yet. Press n to create one.",
         };
         note(frame, area, msg, t);
         return;
@@ -125,7 +125,7 @@ pub fn draw_new_address(frame: &mut Frame, area: Rect, t: &Theme, orchard_only: 
     };
     let lines = vec![
         Line::styled("New unified address", t.title),
-        Line::styled("choose the receivers it includes", t.muted),
+        Line::styled("Select pool receivers", t.muted),
         Line::from(""),
         option(!orchard_only, "orchard and sapling"),
         option(orchard_only, "orchard only"),

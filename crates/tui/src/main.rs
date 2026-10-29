@@ -195,7 +195,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Command::SaveTheme(id) => {
                     let saved = match &config_path {
                         Some(path) => settings::save_theme(path, id).map_err(|e| e.to_string()),
-                        None => Err("this system has no configuration directory".to_string()),
+                        None => Err("no config directory set".to_string()),
                     };
                     if let Err(e) = saved {
                         reduce(state, Action::Notice(format!("theme not saved: {e}")));
