@@ -7,15 +7,18 @@ use pepper_sync::wallet::SyncMode;
 use zcash_protocol::PoolType;
 use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
+use zingo_status::confirmation_status::ConfirmationStatus;
+use zingolib::perspective::value_transfer::{
+    SelfSendValueTransfer, SentValueTransfer, ValueTransferKind,
+};
 use zingolib::wallet::output::SpendStatus;
 use zingolib::wallet::summary::data::{SendType, TransactionKind};
-use zingolib::perspective::value_transfer::{SelfSendValueTransfer, SentValueTransfer, ValueTransferKind};
-use zingo_status::confirmation_status::ConfirmationStatus;
 
 use crate::app::{
-    Action, AddressKind, AddressRow, Balance, Command, InputRow, KeyMaterial, OpenSpec,
-    OutputRole, OutputRow, PoolBalance, SyncNote, Tip,
-    TxRow, WalletData, WalletEntry, WalletEventRow, WalletInfo, WalletKind,
+    Action, AddressKind, AddressRow, Balance, Command, InputRow, KeyMaterial, NetworkRoundRow,
+    OpenSpec, OutputRole, OutputRow, PastBallotRow, PoolBalance, SyncNote, Tip, TxRow, VotingNote,
+    VotingOutcome, VotingStageUpdate, VotingSummary, WalletData, WalletEntry, WalletEventRow,
+    WalletInfo, WalletKind,
 };
 
 const TICK: Duration = Duration::from_millis(500);
@@ -84,6 +87,9 @@ struct Fake {
     sessions: u64,
     next_launch: Option<Instant>,
     ticks: u64,
+    voting_armed: bool,
+    voting_round: Option<String>,
+    tallies: Vec<(u32, u32)>,
 }
 
 impl Fake {
@@ -104,6 +110,9 @@ impl Fake {
             sessions: 0,
             next_launch: None,
             ticks: 0,
+            voting_armed: false,
+            voting_round: None,
+            tallies: Vec::new(),
         }
     }
 
@@ -325,8 +334,12 @@ impl Fake {
                         );
                         let txid = tx.txid.clone();
                         self.data.txs.insert(0, tx);
-                        self.data.balance.orchard.confirmed =
-                            self.data.balance.orchard.confirmed.saturating_sub(amount + fee);
+                        self.data.balance.orchard.confirmed = self
+                            .data
+                            .balance
+                            .orchard
+                            .confirmed
+                            .saturating_sub(amount + fee);
                         Ok(vec![txid])
                     }
                     None => Err("nothing is proposed".to_string()),
@@ -337,9 +350,311 @@ impl Fake {
             Command::CancelSend => {
                 self.proposal = None;
             }
+            Command::FetchVotingRound => {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let round_id = format!("round-{}", self.rng.hex(8));
+                let summary = VotingSummary {
+                    round_id: round_id.clone(),
+                    snapshot_height: u64::from(self.tip) - 120,
+                    vote_end_time_seconds: Self::now_unix() + 3 * 24 * 3600,
+                    eligible_weight_zatoshi: 12_460_000_000,
+                    bundle_count: 2,
+                    proposals: vec![
+                        crate::app::ProposalInfo {
+                            id: 1,
+                            title: "Fund the zingolib core team for Q3".into(),
+                            options: vec![
+                                "Approve the funding request".into(),
+                                "Reject and re-scope".into(),
+                                "Abstain".into(),
+                            ],
+                        },
+                        crate::app::ProposalInfo {
+                            id: 2,
+                            title: "Adopt the grants committee charter".into(),
+                            options: vec!["Ratify".into(), "Reject".into()],
+                        },
+                    ],
+                };
+                self.voting_round = Some(round_id);
+                self.send(Action::Voting(VotingNote::Source("demo".into())));
+                self.send(Action::Voting(VotingNote::Round(Ok(summary))));
+                let past = self.past_ballots();
+                self.send(Action::Voting(VotingNote::Past(Ok(past))));
+                let network = self.network_rounds();
+                self.send(Action::Voting(VotingNote::Network(Ok(network))));
+            }
+            Command::FetchPastBallots => {
+                if self.opened {
+                    self.send(Action::Voting(VotingNote::Source("demo".into())));
+                    let past = self.past_ballots();
+                    self.send(Action::Voting(VotingNote::Past(Ok(past))));
+                    let network = self.network_rounds();
+                    self.send(Action::Voting(VotingNote::Network(Ok(network))));
+                } else {
+                    self.send(Action::Voting(VotingNote::Past(Err(
+                        "no wallet is open".into()
+                    ))));
+                }
+            }
+            Command::FetchRoundTallies(round_id) => {
+                // Label-keyed: (proposal id, option label, zats).
+                let tallies = self
+                    .network_rounds()
+                    .into_iter()
+                    .find(|round| round.round_id == round_id)
+                    .map(|round| {
+                        let (proposals, tallies) = (round.proposals, round.tallies);
+                        proposals
+                            .iter()
+                            .flat_map(|proposal| {
+                                proposal.options.iter().enumerate().map(|(index, label)| {
+                                    let zats = tallies
+                                        .iter()
+                                        .find(|(id, choice, _)| {
+                                            *id == proposal.id && *choice == index as u32
+                                        })
+                                        .map(|(_, _, zats)| *zats)
+                                        .unwrap_or(0);
+                                    (proposal.id, label.clone(), zats)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.send(Action::Voting(VotingNote::RoundTallies {
+                    round_id,
+                    tallies: Ok(tallies),
+                }));
+            }
+            Command::ArmVoting => {
+                if !self.opened {
+                    self.send(Action::Voting(VotingNote::Cast(Err(
+                        "no wallet is open".into()
+                    ))));
+                } else {
+                    self.voting_armed = true;
+                    let actions = self.actions.clone();
+                    tokio::spawn(async move {
+                        let events: Vec<(&str, Option<VotingStageUpdate>)> = vec![
+                            ("config resolved from stage static config", None),
+                            (
+                                "round resolved at snapshot height",
+                                Some(VotingStageUpdate::Arming),
+                            ),
+                            ("round initialized", None),
+                            ("7 notes selected, weight 12460000000 zatoshi", None),
+                            ("hotkey ready", None),
+                            (
+                                "PIR warmup: 512 cached, 3 fetched",
+                                Some(VotingStageUpdate::Armed),
+                            ),
+                        ];
+                        for (line, stage) in events {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            let _ = actions.send(Action::Voting(VotingNote::Event {
+                                line: line.into(),
+                                stage,
+                            }));
+                        }
+                    });
+                }
+            }
+            Command::CastVote(rows) => {
+                let decisions = rows.len();
+                if !self.voting_armed {
+                    self.send(Action::Voting(VotingNote::Cast(Err(
+                        "no armed voting session".into(),
+                    ))));
+                } else {
+                    let actions = self.actions.clone();
+                    let mut tallies = Vec::new();
+                    for (proposal_id, choice) in rows {
+                        tallies.push((proposal_id, choice.unwrap_or(0)));
+                    }
+                    self.tallies = tallies.clone();
+                    tokio::spawn(async move {
+                        let mut lines: Vec<(&str, Option<VotingStageUpdate>)> = Vec::new();
+                        for bundle in 0..2 {
+                            lines.push((
+                                Box::leak(format!("bundle {bundle} prepared").into_boxed_str()),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                            lines.push((
+                                Box::leak(
+                                    format!("bundle {bundle} signed, 6230000000 zatoshi delegated")
+                                        .into_boxed_str(),
+                                ),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                            lines.push((
+                                Box::leak(format!("bundle {bundle} submitted").into_boxed_str()),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                            lines.push((
+                                Box::leak(format!("bundle {bundle} confirmed").into_boxed_str()),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                        }
+                        for (proposal_id, choice) in &tallies {
+                            lines.push((
+                                Box::leak(
+                                    format!("vote committed for proposal {proposal_id} (choice {choice})")
+                                        .into_boxed_str(),
+                                ),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                            lines.push((
+                                Box::leak(
+                                    format!("vote confirmed for proposal {proposal_id}")
+                                        .into_boxed_str(),
+                                ),
+                                Some(VotingStageUpdate::Casting),
+                            ));
+                            for share in 0..2 {
+                                lines.push((
+                                    Box::leak(
+                                        format!(
+                                            "share {share} scheduled for proposal {proposal_id}"
+                                        )
+                                        .into_boxed_str(),
+                                    ),
+                                    Some(VotingStageUpdate::Casting),
+                                ));
+                                lines.push((
+                                    Box::leak(
+                                        format!(
+                                            "share {share} delivered for proposal {proposal_id}"
+                                        )
+                                        .into_boxed_str(),
+                                    ),
+                                    Some(VotingStageUpdate::Casting),
+                                ));
+                            }
+                        }
+                        lines.push(("round finished", Some(VotingStageUpdate::Finished)));
+                        for (line, stage) in lines {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let _ = actions.send(Action::Voting(VotingNote::Event {
+                                line: line.into(),
+                                stage,
+                            }));
+                        }
+                        let _ = actions.send(Action::Voting(VotingNote::Cast(Ok(VotingOutcome {
+                            all_decided: decisions > 0,
+                            blocking_recovery: false,
+                        }))));
+                    });
+                }
+            }
+            Command::FetchVotingResults => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                if self.tallies.is_empty() {
+                    self.send(Action::Voting(VotingNote::Results(Err(
+                        "no tallies yet".into()
+                    ))));
+                } else {
+                    self.send(Action::Voting(VotingNote::Results(Ok(self
+                        .tallies
+                        .clone()))));
+                }
+            }
+            Command::ClearVotingDecision(proposal_id) => {
+                self.send(Action::Voting(VotingNote::Cleared(proposal_id)));
+            }
             Command::Copy(_) | Command::SaveTheme(_) | Command::ForceQuit => {}
         }
         false
+    }
+
+    /// Two rounds of fake history: one finished with votes, one abandoned.
+    fn past_ballots(&mut self) -> Vec<PastBallotRow> {
+        let now = Self::now_unix();
+        vec![
+            PastBallotRow {
+                round_id: self.voting_history_id(0),
+                snapshot_height: u64::from(self.tip) - 21_600,
+                created_at: now - 21 * 24 * 3600,
+                complete: true,
+                votes: vec![(1, 0), (2, 1)],
+            },
+            PastBallotRow {
+                round_id: self.voting_history_id(1),
+                snapshot_height: u64::from(self.tip) - 86_400,
+                created_at: now - 63 * 24 * 3600,
+                complete: false,
+                votes: Vec::new(),
+            },
+        ]
+    }
+
+    /// Stable fake history ids so the network list can mark participation.
+    fn voting_history_id(&self, slot: usize) -> String {
+        let mut rng =
+            Rng(0x5eed_5eed_5eed_5eed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        format!("round-{}", rng.hex(8))
+    }
+
+    /// The network's public round list, fake flavor: the two history rounds
+    /// plus one open round, most recently closing first.
+    fn network_rounds(&mut self) -> Vec<NetworkRoundRow> {
+        let now = Self::now_unix();
+        let past_ids: Vec<String> = (0..2).map(|slot| self.voting_history_id(slot)).collect();
+        vec![
+            NetworkRoundRow {
+                round_id: format!("round-{}", self.rng.hex(8)),
+                end_time: now + 3 * 24 * 3600,
+                snapshot_height: u64::from(self.tip) - 120,
+                open: true,
+                endorsers: Vec::new(),
+                status: 1,
+                tallies: Vec::new(),
+                proposals: vec![
+                    crate::app::ProposalInfo {
+                        id: 1,
+                        title: "Fund the zingolib core team for Q3".into(),
+                        options: vec![
+                            "Approve the funding request".into(),
+                            "Reject and re-scope".into(),
+                            "Abstain".into(),
+                        ],
+                    },
+                    crate::app::ProposalInfo {
+                        id: 2,
+                        title: "Adopt the grants committee charter".into(),
+                        options: vec!["Ratify".into(), "Reject".into()],
+                    },
+                ],
+            },
+            NetworkRoundRow {
+                round_id: past_ids[0].clone(),
+                end_time: now - 14 * 24 * 3600,
+                snapshot_height: u64::from(self.tip) - 21_600,
+                open: false,
+                endorsers: vec!["zodl".into(), "shielded-labs".into()],
+                status: 3,
+                proposals: vec![crate::app::ProposalInfo {
+                    id: 1,
+                    title: "Fund the zingolib core team for Q2".into(),
+                    options: vec!["Approve".into(), "Reject".into()],
+                }],
+                tallies: vec![(1, 0, 1_790_179), (1, 1, 19_007_459), (1, 2, 33_181)],
+            },
+            NetworkRoundRow {
+                round_id: past_ids[1].clone(),
+                end_time: now - 56 * 24 * 3600,
+                snapshot_height: u64::from(self.tip) - 86_400,
+                open: false,
+                endorsers: vec!["zodl".into()],
+                status: 3,
+                proposals: vec![crate::app::ProposalInfo {
+                    id: 1,
+                    title: "Emergency security audit".into(),
+                    options: vec!["Approve".into(), "Reject".into()],
+                }],
+                tallies: vec![(1, 1, 8_004_412)],
+            },
+        ]
     }
 
     fn payment(
@@ -584,7 +899,14 @@ impl Fake {
             (t as u32, height)
         };
         let steps: Vec<Story> = vec![
-            (0, 1, TransactionKind::Received, 42_000_000, None, "lunch on me"),
+            (
+                0,
+                1,
+                TransactionKind::Received,
+                42_000_000,
+                None,
+                "lunch on me",
+            ),
             (
                 1,
                 3,
@@ -593,9 +915,30 @@ impl Fake {
                 Some(15_000),
                 "rent, october",
             ),
-            (2, 9, TransactionKind::Received, 500_000_000, None, "from the exchange"),
-            (5, 7, TransactionKind::Sent(SendType::SendToSelf), 80_000_000, Some(10_000), ""),
-            (6, 1, TransactionKind::Sent(SendType::Shield), 30_000_000, Some(10_000), ""),
+            (
+                2,
+                9,
+                TransactionKind::Received,
+                500_000_000,
+                None,
+                "from the exchange",
+            ),
+            (
+                5,
+                7,
+                TransactionKind::Sent(SendType::SendToSelf),
+                80_000_000,
+                Some(10_000),
+                "",
+            ),
+            (
+                6,
+                1,
+                TransactionKind::Sent(SendType::Shield),
+                30_000_000,
+                Some(10_000),
+                "",
+            ),
             (
                 12,
                 2,
@@ -604,7 +947,14 @@ impl Fake {
                 None,
                 "welcome to the main chain",
             ),
-            (15, 8, TransactionKind::Sent(SendType::Send), 7_500_000, Some(10_000), "coffee"),
+            (
+                15,
+                8,
+                TransactionKind::Sent(SendType::Send),
+                7_500_000,
+                Some(10_000),
+                "coffee",
+            ),
             (19, 3, TransactionKind::Received, 95_000_000, None, ""),
             (
                 31,
@@ -614,9 +964,23 @@ impl Fake {
                 Some(10_000),
                 "thanks for the review",
             ),
-            (36, 4, TransactionKind::Received, 310_000_000, None, "refund"),
+            (
+                36,
+                4,
+                TransactionKind::Received,
+                310_000_000,
+                None,
+                "refund",
+            ),
             (41, 9, TransactionKind::Received, 12_500_000, None, ""),
-            (48, 2, TransactionKind::Sent(SendType::Send), 200_000_000, Some(15_000), ""),
+            (
+                48,
+                2,
+                TransactionKind::Sent(SendType::Send),
+                200_000_000,
+                Some(15_000),
+                "",
+            ),
             (
                 55,
                 6,
@@ -725,16 +1089,12 @@ impl Fake {
                     }],
                     vec![WalletEventRow {
                         kind: match kind {
-                            TransactionKind::Sent(SendType::Shield) => {
-                                ValueTransferKind::Sent(SentValueTransfer::SendToSelf(
-                                    SelfSendValueTransfer::Shield,
-                                ))
-                            }
-                            TransactionKind::Sent(SendType::SendToSelf) => {
-                                ValueTransferKind::Sent(SentValueTransfer::SendToSelf(
-                                    SelfSendValueTransfer::Basic,
-                                ))
-                            }
+                            TransactionKind::Sent(SendType::Shield) => ValueTransferKind::Sent(
+                                SentValueTransfer::SendToSelf(SelfSendValueTransfer::Shield),
+                            ),
+                            TransactionKind::Sent(SendType::SendToSelf) => ValueTransferKind::Sent(
+                                SentValueTransfer::SendToSelf(SelfSendValueTransfer::Basic),
+                            ),
                             _ => ValueTransferKind::Sent(SentValueTransfer::Send),
                         },
                         value,
@@ -788,7 +1148,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::app::{Onboarding, Phase, State, reduce};
+    use crate::app::{Onboarding, OpenSpec, Phase, Screen, State, VotingStage, reduce};
 
     async fn drive(
         state: &mut State,
@@ -853,7 +1213,11 @@ mod tests {
         let info = s.wallet.as_ref().unwrap();
         assert_eq!(info.wallet_name, "main");
         assert_eq!(info.kind, WalletKind::Seed);
-        assert!(s.txs.iter().any(|t| t.kind == TransactionKind::Sent(SendType::Send)));
+        assert!(
+            s.txs
+                .iter()
+                .any(|t| t.kind == TransactionKind::Sent(SendType::Send))
+        );
         assert!(s.txs.iter().any(|t| t.first_memo().is_some()));
         assert!(s.addresses.iter().any(|a| a.kind.is_unified()));
         assert!(s.addresses.iter().any(|a| !a.kind.is_unified()));
@@ -872,7 +1236,8 @@ mod tests {
             .unwrap();
         cmd_tx.send(Command::ConfirmSend).unwrap();
         drive(&mut s, &mut act_rx, &cmd_tx, |s| {
-            s.txs[0].kind == TransactionKind::Sent(SendType::Send) && s.txs[0].first_memo() == Some("rent")
+            s.txs[0].kind == TransactionKind::Sent(SendType::Send)
+                && s.txs[0].first_memo() == Some("rent")
         })
         .await;
         cmd_tx.send(Command::NewTransparentAddress).unwrap();
@@ -880,6 +1245,109 @@ mod tests {
             s.addresses.len() > addresses
         })
         .await;
+        cmd_tx.send(Command::Quit).unwrap();
+        drive(&mut s, &mut act_rx, &cmd_tx, |s| s.exit).await;
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_fake_voting_backend_walks_the_whole_lifecycle() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (act_tx, mut act_rx) = mpsc::unbounded_channel();
+        let task = spawn(cmd_rx, act_tx);
+        let mut s = State::new(
+            Phase::Onboarding(Box::new(Onboarding::new(None))),
+            Instant::now(),
+        );
+        cmd_tx.send(Command::ListWallets).unwrap();
+        drive(
+            &mut s,
+            &mut act_rx,
+            &cmd_tx,
+            |s| matches!(&s.phase, Phase::Onboarding(o) if o.listed),
+        )
+        .await;
+        cmd_tx.send(Command::FetchTip).unwrap();
+        cmd_tx.send(Command::GenerateSeed).unwrap();
+        drive(
+            &mut s,
+            &mut act_rx,
+            &cmd_tx,
+            |s| matches!(&s.phase, Phase::Onboarding(o) if o.tip.is_some() && o.seed.is_some()),
+        )
+        .await;
+        cmd_tx
+            .send(Command::Open(OpenSpec::Read {
+                name: "main".into(),
+            }))
+            .unwrap();
+        drive(&mut s, &mut act_rx, &cmd_tx, |s| {
+            s.phase == Phase::Main && s.data_loaded
+        })
+        .await;
+
+        // Enter the voting screen; the fake round arrives ready to vote on.
+        for command in reduce(&mut s, crate::app::Action::Key(crate::app::Key::Char('v'))) {
+            cmd_tx.send(command).unwrap();
+        }
+        drive(&mut s, &mut act_rx, &cmd_tx, |s| {
+            s.screen == Screen::Voting && s.voting.stage == VotingStage::Ready
+        })
+        .await;
+        assert_eq!(s.voting.ballot.len(), 2);
+        // Two rounds of fabricated history arrived with the round, plus the
+        // network's public list marking this wallet's participation.
+        drive(&mut s, &mut act_rx, &cmd_tx, |s| {
+            !s.voting.past.is_empty() && !s.voting.network.is_empty()
+        })
+        .await;
+        assert_eq!(s.voting.past.len(), 2);
+        assert!(s.voting.past[0].complete);
+        assert!(s.voting.network.len() >= 3);
+        assert!(s.voting.network[0].open);
+        let past_ids: Vec<&str> = s.voting.past.iter().map(|b| b.round_id.as_str()).collect();
+        assert!(
+            s.voting
+                .network
+                .iter()
+                .filter(|r| past_ids.contains(&r.round_id.as_str()))
+                .count()
+                == 2
+        );
+
+        // Fill the ballot: enter picks the highlighted option (proposal 1's
+        // first), skip proposal 2, then move to the Cast vote row and cast.
+        for command in [
+            crate::app::Action::Key(crate::app::Key::Enter),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Enter),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Down),
+            crate::app::Action::Key(crate::app::Key::Enter),
+        ] {
+            for command in reduce(&mut s, command) {
+                cmd_tx.send(command).unwrap();
+            }
+        }
+        assert_eq!(s.voting.stage, VotingStage::Arming);
+
+        // Arming publishes Armed, the reducer casts, the lifecycle runs to
+        // quiescence.
+        drive(&mut s, &mut act_rx, &cmd_tx, |s| {
+            s.voting.stage == VotingStage::Finished
+        })
+        .await;
+        assert!(!s.voting.log.is_empty());
+        assert!(
+            s.voting
+                .log
+                .iter()
+                .any(|line| line.contains("vote committed"))
+        );
         cmd_tx.send(Command::Quit).unwrap();
         drive(&mut s, &mut act_rx, &cmd_tx, |s| s.exit).await;
         task.await.unwrap();

@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::modal;
-use zingolib_tui_core::app::{State, WalletKind};
 use crate::theme::Theme;
+use zingolib_tui_core::app::{State, WalletKind};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &State, t: &Theme) {
     let key = |k: &str, what: &str| {
@@ -18,8 +18,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State, t: &Theme) {
         Line::styled("zingolib-tui — keys", t.title),
         Line::from(""),
         key(
-            "h p t r a s",
-            "home, pay, transactions, receive, addresses, sync",
+            "h p t r a s v b",
+            "home, pay, transactions, receive, addresses, sync, voting, ballots",
         ),
         key("j / k · ↑ / ↓", "move; g G, home, end jump"),
         key("enter", "open the row"),
@@ -28,6 +28,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State, t: &Theme) {
         key("", "receive: unified ⇄ transparent address"),
         key("n", "make a new address"),
         key("p", "pay: send ZEC to an address, with a memo"),
+        key("v", "voting: pick options per proposal, enter casts"),
         key("y", "copy the txid or address"),
         key("space", "sync: pause or resume"),
         key("m", "sync: chain strip ⇄ chain map"),

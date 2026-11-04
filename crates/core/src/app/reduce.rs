@@ -1,10 +1,11 @@
 use std::time::Instant;
 
-use super::action::{Action, Command, Key, SyncNote};
+use super::action::{Action, Command, Key, SyncNote, VotingNote, VotingStageUpdate};
 use super::onboarding;
 use super::state::{
     DetailMode, FoundTx, Overlay, Phase, ReceiveKind, Screen, SendField, SendForm, SendStage, State,
 };
+use super::voting::VotingStage;
 use crate::format;
 
 pub fn reduce(state: &mut State, action: Action) -> Vec<Command> {
@@ -100,6 +101,182 @@ pub fn reduce(state: &mut State, action: Action) -> Vec<Command> {
                     state.send.error = Some(e);
                     state.send.stage = SendStage::Edit;
                 }
+            }
+            Vec::new()
+        }
+        Action::Voting(note) => on_voting(state, note),
+    }
+}
+
+/// Folds voting notes into the screen's view state.
+fn on_voting(state: &mut State, note: VotingNote) -> Vec<Command> {
+    let voting = &mut state.voting;
+    match note {
+        VotingNote::Round(Ok(summary)) => {
+            voting.push_log(format!(
+                "round {} resolved at snapshot {}",
+                summary.round_id, summary.snapshot_height
+            ));
+            voting.load_round(
+                summary.round_id,
+                summary.snapshot_height,
+                summary.vote_end_time_seconds,
+                summary.eligible_weight_zatoshi,
+                summary.bundle_count,
+                summary.proposals,
+            );
+            vec![Command::FetchVotingResults]
+        }
+        VotingNote::Round(Err(error)) => {
+            voting.push_log(format!("round fetch failed: {error}"));
+            if error.contains("NoActiveRound") || error.to_lowercase().contains("no active") {
+                voting.stage = VotingStage::Idle;
+                state.set_notice("no round is open right now - history has past ballots");
+            } else {
+                voting.stage = VotingStage::Failed(error);
+            }
+            Vec::new()
+        }
+        VotingNote::Event { line, stage } => {
+            let failure = line.clone();
+            voting.push_log(line);
+            match stage {
+                Some(VotingStageUpdate::Arming) => voting.stage = VotingStage::Arming,
+                Some(VotingStageUpdate::Armed) => {
+                    voting.stage = VotingStage::Armed;
+                    let rows = voting
+                        .ballot
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.proposal_id,
+                                match row.choice {
+                                    Some(0) | None => None,
+                                    Some(n) => Some(n - 1),
+                                },
+                            )
+                        })
+                        .collect();
+                    return vec![Command::CastVote(rows)];
+                }
+                Some(VotingStageUpdate::Casting) => voting.stage = VotingStage::Casting,
+                Some(VotingStageUpdate::Finished) => voting.stage = VotingStage::Finished,
+                Some(VotingStageUpdate::Failed) => {
+                    voting.stage = VotingStage::Failed(failure);
+                }
+                None => {}
+            }
+            Vec::new()
+        }
+        VotingNote::Cast(Ok(outcome)) => {
+            voting.push_log(format!(
+                "cast finished: all_decided={}, recovery={}",
+                outcome.all_decided, outcome.blocking_recovery
+            ));
+            voting.stage = VotingStage::Finished;
+            vec![Command::FetchVotingResults]
+        }
+        VotingNote::Cast(Err(error)) => {
+            voting.push_log(format!("cast failed: {error}"));
+            voting.stage = VotingStage::Failed(error);
+            Vec::new()
+        }
+        VotingNote::JournalLoaded(journal) => {
+            let restored = journal.len();
+            for (proposal_id, decision) in journal {
+                if let Some(row) = voting
+                    .ballot
+                    .iter_mut()
+                    .find(|row| row.proposal_id == proposal_id)
+                {
+                    row.choice = Some(decision.map_or(0, |choice| choice + 1));
+                    row.journaled = true;
+                }
+            }
+            if restored > 0 {
+                voting.push_log(format!("{restored} journaled decision(s) restored"));
+            }
+            Vec::new()
+        }
+        VotingNote::Cleared(proposal_id) => {
+            if let Some(row) = voting
+                .ballot
+                .iter_mut()
+                .find(|row| row.proposal_id == proposal_id)
+            {
+                row.choice = None;
+                row.journaled = false;
+            }
+            state.set_notice(format!("cleared decision on proposal {proposal_id}"));
+            Vec::new()
+        }
+        VotingNote::Results(Ok(rows)) => {
+            for (proposal_id, choice) in &rows {
+                voting.push_log(format!(
+                    "tally: proposal {proposal_id} choice {}",
+                    choice + 1
+                ));
+            }
+            voting.tallies = rows;
+            Vec::new()
+        }
+        VotingNote::Past(Ok(rows)) => {
+            let count = rows.len();
+            voting.past = rows;
+            merge_history(voting);
+            if count > 0 {
+                voting.push_log(format!("{count} previous ballot(s) on file"));
+            }
+            Vec::new()
+        }
+        VotingNote::Past(Err(_)) => Vec::new(),
+        VotingNote::Source(source) => {
+            voting.source = source;
+            voting.push_log(format!("voting network: {}", voting.source_label()));
+            Vec::new()
+        }
+        VotingNote::Network(Ok(rows)) => {
+            voting.push_log(format!(
+                "network lists {} round(s), {} endorsed",
+                rows.len(),
+                rows.iter().filter(|row| !row.endorsers.is_empty()).count()
+            ));
+            voting.network = rows;
+            merge_history(voting);
+            Vec::new()
+        }
+        VotingNote::Network(Err(_)) => Vec::new(),
+        VotingNote::RoundTallies { round_id, tallies } => {
+            if let (Ok(raw), Some(row)) = (
+                tallies,
+                voting
+                    .history
+                    .iter_mut()
+                    .find(|row| row.round_id == round_id),
+            ) {
+                // Map option labels to their index in the round's options.
+                row.tallies = raw
+                    .into_iter()
+                    .filter_map(|(proposal_id, label, zats)| {
+                        let index = row
+                            .proposals
+                            .iter()
+                            .find(|proposal| proposal.id == proposal_id)
+                            .and_then(|proposal| {
+                                proposal
+                                    .options
+                                    .iter()
+                                    .position(|option| option.eq_ignore_ascii_case(&label))
+                            })? as u32;
+                        Some((proposal_id, index, zats))
+                    })
+                    .collect();
+            }
+            Vec::new()
+        }
+        VotingNote::Results(Err(error)) => {
+            if voting.stage == VotingStage::Finished {
+                voting.push_log(format!("results unavailable: {error}"));
             }
             Vec::new()
         }
@@ -505,6 +682,14 @@ fn screen_key(state: &mut State, key: Key) -> Vec<Command> {
             state.screen = Screen::Sync;
             return Vec::new();
         }
+        Key::Char('v') => {
+            state.screen = Screen::Voting;
+            return vec![Command::FetchVotingRound, Command::FetchPastBallots];
+        }
+        Key::Char('b') => {
+            state.screen = Screen::Ballots;
+            return vec![Command::FetchPastBallots];
+        }
         Key::Esc => {
             state.screen = Screen::Home;
             return Vec::new();
@@ -525,7 +710,7 @@ fn screen_key(state: &mut State, key: Key) -> Vec<Command> {
             Vec::new()
         }
         Screen::Receive => match key {
-            Key::Char('v') => {
+            Key::Char('u') => {
                 state.receive_kind = match state.receive_kind {
                     ReceiveKind::Unified => ReceiveKind::Transparent,
                     ReceiveKind::Transparent => ReceiveKind::Unified,
@@ -558,6 +743,8 @@ fn screen_key(state: &mut State, key: Key) -> Vec<Command> {
                 _ => Vec::new(),
             }
         }
+        Screen::Voting => voting_key(state, key),
+        Screen::Ballots => ballots_key(state, key),
         Screen::Sync => match key {
             Key::Char(' ') => match state.sync.p_pauses() {
                 Some(true) => vec![Command::PauseSync],
@@ -613,44 +800,55 @@ fn move_selection(selected: &mut usize, len: usize, key: Key, rows: u16) {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+fn now() -> Instant {
+    Instant::now()
+}
+
+#[cfg(test)]
+fn main_state() -> State {
+    let mut s = State::new(Phase::Main, now());
+    s.wallet = Some(crate::app::state::WalletInfo {
+        wallet_name: "w.dat".into(),
+        wallet_path: "/tmp/w.dat".into(),
+        birthday: 100,
+        server: "https://mainnet.zainod.zingolabs.dev:443".into(),
+        has_orchard: true,
+        spacing_secs: 75,
+        kind: crate::app::state::WalletKind::Watch,
+    });
+    s
+}
+
+#[cfg(test)]
+fn keys(state: &mut State, keys: &[Key]) -> Vec<Command> {
+    keys.iter()
+        .flat_map(|k| reduce(state, Action::Key(*k)))
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pepper_sync::sync::{ScanPriority, ScanRange};
     use pepper_sync::wallet::SyncMode;
     use zcash_protocol::consensus::BlockHeight;
-    use zingolib::wallet::summary::data::TransactionKind;
     use zingo_status::confirmation_status::ConfirmationStatus;
+    use zingolib::wallet::summary::data::TransactionKind;
 
-    use crate::app::state::{
-        AddressKind, AddressRow, Stage, TxRow, WalletData, WalletInfo, WalletKind,
-    };
+    use crate::app::state::{AddressKind, AddressRow, Stage, TxRow, WalletData, WalletKind};
 
     fn range(start: u32, end: u32, priority: ScanPriority) -> ScanRange {
-        ScanRange::from_parts(BlockHeight::from_u32(start)..BlockHeight::from_u32(end), priority)
+        ScanRange::from_parts(
+            BlockHeight::from_u32(start)..BlockHeight::from_u32(end),
+            priority,
+        )
     }
 
     fn confirmed(height: u32) -> ConfirmationStatus {
         ConfirmationStatus::Confirmed(BlockHeight::from_u32(height))
     }
     use std::time::Duration;
-
-    fn now() -> Instant {
-        Instant::now()
-    }
-
-    fn main_state() -> State {
-        let mut s = State::new(Phase::Main, now());
-        s.wallet = Some(WalletInfo {
-            wallet_name: "w.dat".into(),
-            wallet_path: "/tmp/w.dat".into(),
-            birthday: 100,
-            server: "https://mainnet.zainod.zingolabs.dev:443".into(),
-            has_orchard: true,
-            spacing_secs: 75,
-            kind: WalletKind::Watch,
-        });
-        s
-    }
 
     fn tx(i: u32) -> TxRow {
         TxRow {
@@ -665,12 +863,6 @@ mod tests {
             outputs: Vec::new(),
             wallet_events: Vec::new(),
         }
-    }
-
-    fn keys(state: &mut State, keys: &[Key]) -> Vec<Command> {
-        keys.iter()
-            .flat_map(|k| reduce(state, Action::Key(*k)))
-            .collect()
     }
 
     #[test]
@@ -810,7 +1002,7 @@ mod tests {
                 sapling: false
             }]
         );
-        keys(&mut s, &[Key::Char('v')]);
+        keys(&mut s, &[Key::Char('u')]);
         assert_eq!(s.receive_kind, ReceiveKind::Transparent);
         let cmds = keys(&mut s, &[Key::Char('n')]);
         assert_eq!(cmds, vec![Command::NewTransparentAddress]);
@@ -1035,10 +1227,7 @@ mod tests {
             }]
         );
         assert_eq!(s.send.stage, SendStage::Proposing);
-        let cmds = reduce(
-            &mut s,
-            Action::SendProposed(Ok((10_000, 150_010_000))),
-        );
+        let cmds = reduce(&mut s, Action::SendProposed(Ok((10_000, 150_010_000))));
         assert!(cmds.is_empty());
         assert_eq!(
             s.send.stage,
@@ -1051,7 +1240,12 @@ mod tests {
         assert_eq!(s.send.stage, SendStage::Sending);
         let cmds = reduce(&mut s, Action::SendDone(Ok(vec!["txid1".into()])));
         assert_eq!(cmds, vec![Command::Refresh]);
-        assert_eq!(s.send.stage, SendStage::Sent { txids: vec!["txid1".into()] });
+        assert_eq!(
+            s.send.stage,
+            SendStage::Sent {
+                txids: vec!["txid1".into()]
+            }
+        );
         keys(&mut s, &[Key::Esc]);
         assert_eq!(s.screen, Screen::Home);
     }
@@ -1083,5 +1277,417 @@ mod tests {
         let cmds = reduce(&mut s, Action::WalletOpened(main_state().wallet.unwrap()));
         assert_eq!(cmds, vec![Command::Refresh]);
         assert_eq!(s.phase, Phase::Main);
+    }
+}
+
+/// Keys on the voting screen: pick a proposal, pick an option, cast.
+fn voting_key(state: &mut State, key: Key) -> Vec<Command> {
+    let voting = &mut state.voting;
+    match key {
+        Key::Up
+        | Key::Char('k')
+        | Key::Down
+        | Key::Char('j')
+        | Key::PageUp
+        | Key::PageDown
+        | Key::Home
+        | Key::End => {
+            let len = voting.selectable_len();
+            move_selection(&mut voting.selected, len, key, state.size.1);
+            Vec::new()
+        }
+        Key::Enter => {
+            if voting.stage != VotingStage::Ready {
+                return Vec::new();
+            }
+            let item = voting.selected_item();
+            match item {
+                // An option line: picking it sets that proposal's vote.
+                Some((proposal, Some(option))) => {
+                    if let Some(row) = voting.ballot.get_mut(proposal)
+                        && option <= row.options
+                    {
+                        row.choice = Some(option);
+                    }
+                    Vec::new()
+                }
+                // A Skip line.
+                Some((proposal, None)) => {
+                    if let Some(row) = voting.ballot.get_mut(proposal) {
+                        row.choice = Some(0);
+                    }
+                    Vec::new()
+                }
+                // The Cast vote row.
+                None => match voting.stage {
+                    VotingStage::Ready if voting.decided_all() => {
+                        voting.stage = VotingStage::Arming;
+                        vec![Command::ArmVoting]
+                    }
+                    VotingStage::Ready => {
+                        state.set_notice(
+                            "pick an option for every proposal first - enter sets the highlighted one",
+                        );
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                },
+            }
+        }
+        Key::Char('u') => {
+            if let Some((proposal, _)) = voting.selected_item()
+                && let Some(row) = voting.ballot.get_mut(proposal)
+            {
+                row.choice = None;
+                let proposal_id = row.proposal_id;
+                if row.journaled {
+                    return vec![Command::ClearVotingDecision(proposal_id)];
+                }
+            }
+            Vec::new()
+        }
+        Key::Char('R') => {
+            voting.stage = VotingStage::Loading;
+            vec![Command::FetchVotingRound]
+        }
+        Key::Tab | Key::Char('b') => {
+            state.screen = Screen::Ballots;
+            vec![Command::FetchPastBallots]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The Ballots screen: a compact list; Enter opens one round's details.
+fn ballots_key(state: &mut State, key: Key) -> Vec<Command> {
+    let voting = &mut state.voting;
+    if voting.history_detail.is_some() {
+        match key {
+            Key::Left => {
+                voting.history_detail = None;
+                voting.scroll = 0;
+                Vec::new()
+            }
+            // The detail is a document: the movement keys scroll it.
+            Key::Up | Key::Char('k') => {
+                voting.scroll = voting.scroll.saturating_sub(1);
+                Vec::new()
+            }
+            Key::Down | Key::Char('j') => {
+                voting.scroll = voting.scroll.saturating_add(1);
+                Vec::new()
+            }
+            Key::PageUp => {
+                voting.scroll = voting
+                    .scroll
+                    .saturating_sub(state.size.1.saturating_sub(6).max(1));
+                Vec::new()
+            }
+            Key::PageDown => {
+                voting.scroll = voting
+                    .scroll
+                    .saturating_add(state.size.1.saturating_sub(6).max(1));
+                Vec::new()
+            }
+            Key::Home => {
+                voting.scroll = 0;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        match key {
+            Key::Up | Key::Char('k') | Key::Down | Key::Char('j') => {
+                move_selection(
+                    &mut voting.history_selected,
+                    voting.history.len(),
+                    key,
+                    state.size.1,
+                );
+                Vec::new()
+            }
+            Key::Enter | Key::Right => {
+                if let Some(row) = voting.history.get(voting.history_selected) {
+                    voting.history_detail = Some(voting.history_selected);
+                    voting.scroll = 0;
+                    let round_id = row.round_id.clone();
+                    let needs_tallies = row.status == 3 && row.tallies.is_empty();
+                    if needs_tallies {
+                        vec![Command::FetchRoundTallies(round_id)]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
+            Key::Left => {
+                state.screen = Screen::Voting;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Rebuilds the merged history list: the network's rounds joined with the
+/// sidecar's record of this wallet's participation. Preserves tallies
+/// already fetched and keeps the selection clamped.
+fn merge_history(voting: &mut crate::app::voting::VotingView) {
+    let previous = std::mem::take(&mut voting.history);
+    let tally_of = |round_id: &str| {
+        previous
+            .iter()
+            .find(|row| row.round_id == round_id)
+            .map(|row| row.tallies.clone())
+            .unwrap_or_default()
+    };
+    for round in &voting.network {
+        voting.history.push(crate::app::voting::HistoryRow {
+            round_id: round.round_id.clone(),
+            end_time: round.end_time,
+            snapshot_height: round.snapshot_height,
+            status: round.status,
+            proposals: round.proposals.clone(),
+            my_votes: voting
+                .past
+                .iter()
+                .find(|ballot| ballot.round_id == round.round_id)
+                .map(|ballot| ballot.votes.clone())
+                .unwrap_or_default(),
+            tallies: tally_of(&round.round_id),
+            endorsers: round.endorsers.clone(),
+        });
+    }
+    // Sidecar rounds the network no longer lists still belong to history.
+    for ballot in &voting.past {
+        if !voting
+            .history
+            .iter()
+            .any(|row| row.round_id == ballot.round_id)
+        {
+            voting.history.push(crate::app::voting::HistoryRow {
+                round_id: ballot.round_id.clone(),
+                end_time: 0,
+                snapshot_height: ballot.snapshot_height,
+                status: 0,
+                proposals: Vec::new(),
+                my_votes: ballot.votes.clone(),
+                tallies: tally_of(&ballot.round_id),
+                endorsers: Vec::new(),
+            });
+        }
+    }
+    // Open rounds first (soonest closing at the top), then the rest,
+    // newest close first. Every round stays its own row.
+    voting.history.sort_by(|a, b| {
+        let open_a = a.status == 1;
+        let open_b = b.status == 1;
+        open_b.cmp(&open_a).then_with(|| {
+            if open_a && open_b {
+                a.end_time.cmp(&b.end_time)
+            } else {
+                b.end_time.cmp(&a.end_time)
+            }
+        })
+    });
+    voting.history_selected = voting
+        .history_selected
+        .min(voting.history.len().saturating_sub(1));
+}
+
+#[cfg(test)]
+mod voting_tests {
+    use super::super::action::{VotingNote, VotingStageUpdate, VotingSummary};
+    use super::*;
+    use crate::app::voting::VotingStage;
+
+    fn summary() -> VotingSummary {
+        VotingSummary {
+            round_id: "abc123".into(),
+            snapshot_height: 3_000_000,
+            vote_end_time_seconds: 1_900_000_000,
+            eligible_weight_zatoshi: 12_460_000_000,
+            bundle_count: 2,
+            proposals: vec![
+                crate::app::ProposalInfo {
+                    id: 1,
+                    title: "Fund core dev".into(),
+                    options: vec!["Approve".into(), "Reject".into(), "Abstain".into()],
+                },
+                crate::app::ProposalInfo {
+                    id: 2,
+                    title: "Charter".into(),
+                    options: vec!["Ratify".into(), "Reject".into()],
+                },
+            ],
+        }
+    }
+
+    pub(super) fn voting_state() -> State {
+        let mut s = main_state();
+        s.screen = Screen::Voting;
+        let _ = reduce(&mut s, Action::Voting(VotingNote::Round(Ok(summary()))));
+        s
+    }
+
+    #[test]
+    fn v_key_switches_screen_and_fetches() {
+        let mut s = main_state();
+        let commands = keys(&mut s, &[Key::Char('v')]);
+        assert_eq!(s.screen, Screen::Voting);
+        assert_eq!(
+            commands,
+            vec![Command::FetchVotingRound, Command::FetchPastBallots]
+        );
+    }
+
+    #[test]
+    fn round_note_opens_the_ballot_and_pulls_results() {
+        let mut s = main_state();
+        s.screen = Screen::Voting;
+        let commands = reduce(&mut s, Action::Voting(VotingNote::Round(Ok(summary()))));
+        assert_eq!(s.voting.stage, VotingStage::Ready);
+        assert_eq!(s.voting.ballot.len(), 2);
+        assert_eq!(commands, vec![Command::FetchVotingResults]);
+    }
+
+    #[test]
+    fn round_failure_lands_on_failed() {
+        let mut s = main_state();
+        s.screen = Screen::Voting;
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::Round(Err("offline".into()))),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Failed("offline".into()));
+    }
+
+    #[test]
+    fn enter_only_casts_from_the_cast_row() {
+        let mut s = voting_state();
+        keys(&mut s, &[Key::Enter]);
+        keys(&mut s, &[Key::Down, Key::Enter]);
+        // Undecided ballot on the Cast row explains itself.
+        keys(&mut s, &[Key::End]);
+        assert!(s.voting.on_cast_row());
+        assert!(keys(&mut s, &[Key::Enter]).is_empty());
+        assert_eq!(
+            s.notice_text(),
+            Some("pick an option for every proposal first - enter sets the highlighted one")
+        );
+        // Complete ballot casts: Up lands on proposal 2's Skip line, enter
+        // sets it, then the Cast row arms.
+        let commands = keys(&mut s, &[Key::Up, Key::Enter, Key::Down, Key::Enter]);
+        assert_eq!(commands, vec![Command::ArmVoting]);
+        assert_eq!(s.voting.stage, VotingStage::Arming);
+    }
+
+    #[test]
+    fn no_active_round_reads_as_empty_not_failed() {
+        let mut s = voting_state();
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::Round(Err(
+                "voting failure: NoActiveRound".into()
+            ))),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Idle);
+        assert!(s.notice_text().unwrap().contains("no round is open"));
+    }
+
+    #[test]
+    fn finished_ballot_is_read_only() {
+        let mut s = voting_state();
+        s.voting.stage = VotingStage::Finished;
+        keys(&mut s, &[Key::Char('1'), Key::Right]);
+        assert_eq!(s.voting.ballot[0].choice, None);
+        assert_eq!(keys(&mut s, &[Key::Enter]), Vec::new());
+    }
+
+    #[test]
+    fn incomplete_ballot_explains_itself_on_cast() {
+        let mut s = voting_state();
+        keys(&mut s, &[Key::Enter, Key::End, Key::Enter]);
+        assert!(keys(&mut s, &[Key::Enter]).is_empty());
+        assert_eq!(s.voting.stage, VotingStage::Ready);
+        assert_eq!(
+            s.notice_text(),
+            Some("pick an option for every proposal first - enter sets the highlighted one")
+        );
+    }
+
+    #[test]
+    fn armed_event_casts_the_journaled_ballot() {
+        let mut s = voting_state();
+        keys(
+            &mut s,
+            &[
+                Key::Down,
+                Key::Enter,
+                Key::Down,
+                Key::Down,
+                Key::Down,
+                Key::Down,
+                Key::Down,
+                Key::Down,
+                Key::Down,
+                Key::Enter,
+            ],
+        );
+        let commands = reduce(
+            &mut s,
+            Action::Voting(VotingNote::Event {
+                line: "session armed".into(),
+                stage: Some(VotingStageUpdate::Armed),
+            }),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Armed);
+        assert_eq!(
+            commands,
+            vec![Command::CastVote(vec![(1, Some(1)), (2, None)])]
+        );
+    }
+
+    #[test]
+    fn journal_restores_one_based_choices() {
+        let mut s = voting_state();
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::JournalLoaded(vec![(1, Some(0)), (2, None)])),
+        );
+        assert_eq!(s.voting.ballot[0].choice, Some(1));
+        assert!(s.voting.ballot[0].journaled);
+        assert_eq!(s.voting.ballot[1].choice, Some(0));
+        assert!(s.voting.ballot[1].journaled);
+    }
+
+    #[test]
+    fn clear_drops_a_journaled_choice() {
+        let mut s = voting_state();
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::JournalLoaded(vec![(1, Some(2))])),
+        );
+        let commands = keys(&mut s, &[Key::Char('u')]);
+        assert_eq!(commands, vec![Command::ClearVotingDecision(1)]);
+        reduce(&mut s, Action::Voting(VotingNote::Cleared(1)));
+        assert_eq!(s.voting.ballot[0].choice, None);
+        assert!(!s.voting.ballot[0].journaled);
+    }
+
+    #[test]
+    fn cast_outcome_finishes_and_pulls_results() {
+        let mut s = voting_state();
+        s.voting.stage = VotingStage::Casting;
+        let commands = reduce(
+            &mut s,
+            Action::Voting(VotingNote::Cast(Ok(crate::app::VotingOutcome {
+                all_decided: true,
+                blocking_recovery: false,
+            }))),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Finished);
+        assert_eq!(commands, vec![Command::FetchVotingResults]);
     }
 }

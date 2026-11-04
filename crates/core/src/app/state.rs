@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 use pepper_sync::sync::{ScanPriority, ScanRange};
 use pepper_sync::wallet::SyncMode;
 use zcash_protocol::PoolType;
+use zingo_status::confirmation_status::ConfirmationStatus;
 use zingolib::perspective::value_transfer::{
     SelfSendValueTransfer, SentValueTransfer, ValueTransferKind,
 };
 use zingolib::wallet::output::SpendStatus;
 use zingolib::wallet::summary::data::{SendType, TransactionKind};
-use zingo_status::confirmation_status::ConfirmationStatus;
+
+use super::voting::VotingView;
 
 use crate::chain;
 
@@ -56,7 +58,10 @@ pub fn spend_describe(spend: &SpendStatus) -> String {
     match spend {
         SpendStatus::Unspent => "unspent".into(),
         SpendStatus::Spent(txid) => {
-            format!("spent by {}", crate::format::truncate_middle(&txid.to_string(), 18))
+            format!(
+                "spent by {}",
+                crate::format::truncate_middle(&txid.to_string(), 18)
+            )
         }
         SpendStatus::CalculatedSpent(txid)
         | SpendStatus::TransmittedSpent(txid)
@@ -77,16 +82,20 @@ pub enum Screen {
     Receive,
     Addresses,
     Sync,
+    Voting,
+    Ballots,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 6] = [
+    pub const ALL: [Screen; 8] = [
         Screen::Home,
         Screen::Pay,
         Screen::Transactions,
         Screen::Receive,
         Screen::Addresses,
         Screen::Sync,
+        Screen::Voting,
+        Screen::Ballots,
     ];
 
     pub fn title(self) -> &'static str {
@@ -97,6 +106,8 @@ impl Screen {
             Screen::Receive => "Receive",
             Screen::Addresses => "Addresses",
             Screen::Sync => "Sync",
+            Screen::Voting => "Voting",
+            Screen::Ballots => "Ballots",
         }
     }
 }
@@ -111,17 +122,11 @@ pub enum DetailMode {
 pub enum Overlay {
     None,
     Help,
-    TxDetail {
-        mode: DetailMode,
-    },
+    TxDetail { mode: DetailMode },
     RescanConfirm,
-    NewUnifiedAddress {
-        orchard_only: bool,
-    },
+    NewUnifiedAddress { orchard_only: bool },
     AddressQr,
-    ThemePicker {
-        original: usize,
-    },
+    ThemePicker { original: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,14 +166,9 @@ impl SendField {
 pub enum SendStage {
     Edit,
     Proposing,
-    Confirm {
-        fee: u64,
-        total: u64,
-    },
+    Confirm { fee: u64, total: u64 },
     Sending,
-    Sent {
-        txids: Vec<String>,
-    },
+    Sent { txids: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -719,14 +719,10 @@ impl SyncView {
         let overlaps = |a: u32, b: u32| a < end && start < b;
         let mut covered = false;
         let mut scanned = true;
-        for range in self
-            .chain_ranges
-            .iter()
-            .filter(|r| {
-                let block_range = r.block_range();
-                overlaps(u32::from(block_range.start), u32::from(block_range.end))
-            })
-        {
+        for range in self.chain_ranges.iter().filter(|r| {
+            let block_range = r.block_range();
+            overlaps(u32::from(block_range.start), u32::from(block_range.end))
+        }) {
             covered = true;
             match range.priority() {
                 ScanPriority::Scanning | ScanPriority::RefetchingNullifiers => {
@@ -839,6 +835,7 @@ pub struct State {
     pub detail_scroll: u16,
     pub sync: SyncView,
     pub sync_map: bool,
+    pub voting: VotingView,
     pub notice: Option<(String, Instant)>,
     pub now: Instant,
     pub ticks: u64,
@@ -870,6 +867,7 @@ impl State {
             detail_scroll: 0,
             sync: SyncView::new(),
             sync_map: false,
+            voting: VotingView::new(),
             notice: None,
             now,
             ticks: 0,

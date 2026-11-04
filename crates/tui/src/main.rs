@@ -62,6 +62,19 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(ufvk) = &cli.ufvk {
         zingolib_tui_core::app::onboarding::check_ufvk(ufvk)?;
     }
+    if cli.voting_staging {
+        // Safety: single-threaded here, before any backend task or TLS
+        // provider that could read the environment concurrently. A source
+        // already set by the operator wins over the flag.
+        if std::env::var(zingolib_voting::STATIC_CONFIG_SOURCE_ENV).is_err() {
+            unsafe {
+                std::env::set_var(
+                    zingolib_voting::STATIC_CONFIG_SOURCE_ENV,
+                    zingolib_voting::STAGING_STATIC_VOTING_CONFIG_SOURCE,
+                );
+            }
+        }
+    }
     let config = BackendConfig {
         data_dir: cli.data_dir.clone(),
         server: cli.server.clone(),
@@ -107,7 +120,11 @@ async fn run(cli: Cli) -> Result<(), String> {
                 path.display()
             ));
         }
-        placeholder = Some(WalletInfo::placeholder(name.clone(), WalletKind::Unknown, 0));
+        placeholder = Some(WalletInfo::placeholder(
+            name.clone(),
+            WalletKind::Unknown,
+            0,
+        ));
         (Phase::Main, Command::Open(OpenSpec::Read { name }))
     } else {
         (
@@ -131,10 +148,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         .map(settings::Settings::read)
         .unwrap_or_default();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-    state.theme = zingolib_tui_core::palette::choose(cli.theme.as_deref(), saved.theme.as_deref(), no_color);
+    state.theme =
+        zingolib_tui_core::palette::choose(cli.theme.as_deref(), saved.theme.as_deref(), no_color);
     crossterm::style::force_color_output(true);
-    state.color_depth =
-        ColorDepth::from_flag(&cli.color_depth).unwrap_or_else(ColorDepth::detect);
+    state.color_depth = ColorDepth::from_flag(&cli.color_depth).unwrap_or_else(ColorDepth::detect);
     tracing::info!(
         "theme {} at {:?}",
         zingolib_tui_core::palette::THEMES[state.theme].id,
