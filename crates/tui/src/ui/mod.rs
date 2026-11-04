@@ -1,4 +1,5 @@
 mod addresses;
+mod ballots;
 mod bignum;
 mod diagram;
 mod dither;
@@ -12,6 +13,7 @@ mod sigil;
 mod sync;
 mod themes;
 mod transactions;
+mod voting;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -20,7 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use pepper_sync::wallet::SyncMode;
-use zingolib_tui_core::app::{Overlay, Phase, Screen, SendStage, State};
+use zingolib_tui_core::app::{Overlay, Phase, Screen, SendStage, State, VotingStage};
 
 use crate::theme::Theme;
 
@@ -86,7 +88,8 @@ pub fn view(frame: &mut Frame, state: &State) {
     }
 }
 
-pub fn split(area: Rect) -> [Rect; 3] {    Layout::vertical([
+pub fn split(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -252,6 +255,8 @@ fn draw_main(frame: &mut Frame, area: Rect, state: &State, t: &Theme) {
             Screen::Receive => receive::draw(frame, body, state, t),
             Screen::Addresses => addresses::draw(frame, body, state, t),
             Screen::Sync => sync::draw(frame, body, state, t),
+            Screen::Voting => voting::draw(frame, body, state, t),
+            Screen::Ballots => ballots::draw(frame, body, state, t),
         },
     }
     if state.overlay == Overlay::None {
@@ -363,7 +368,7 @@ fn hints(state: &State) -> String {
                 },
                 Screen::Transactions => vec![("j/k", "move"), ("enter", "open")],
                 Screen::Receive => vec![
-                    ("v", "unified ⇄ transparent"),
+                    ("u", "unified ⇄ transparent"),
                     ("n", "new address"),
                     ("y", "copy"),
                 ],
@@ -384,6 +389,25 @@ fn hints(state: &State) -> String {
                     pairs.push(("m", if state.sync_map { "strip" } else { "chain map" }));
                     pairs.push(("R", "rescan"));
                     pairs
+                }
+                Screen::Voting => {
+                    let mut pairs = match state.voting.stage {
+                        VotingStage::Ready => {
+                            vec![("←/→", "switch option"), ("enter", "cast (last row)")]
+                        }
+                        VotingStage::Finished => vec![("R", "fetch next round")],
+                        VotingStage::Idle | VotingStage::Failed(_) => vec![("R", "fetch round")],
+                        _ => Vec::new(),
+                    };
+                    pairs.push(("b", "ballots"));
+                    pairs.push(("j/k", "move"));
+                    pairs
+                }
+                Screen::Ballots if state.voting.history_detail.is_some() => {
+                    vec![("j/k", "scroll"), ("←", "back")]
+                }
+                Screen::Ballots => {
+                    vec![("j/k", "move"), ("enter", "details"), ("←", "voting")]
                 }
             };
             pairs.push(("?", "help"));

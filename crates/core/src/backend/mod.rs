@@ -1,4 +1,5 @@
 pub mod fake;
+mod voting;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -8,24 +9,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pepper_sync::config::{PerformanceLevel, SyncConfig, TransparentAddressDiscovery};
 use pepper_sync::sync::sync_status;
-use pepper_sync::wallet::{IronwoodNote, OrchardNote, OutputInterface, SaplingNote, TransparentCoin};
+use pepper_sync::wallet::{
+    IronwoodNote, OrchardNote, OutputInterface, SaplingNote, TransparentCoin,
+};
 use tokio::sync::mpsc;
 use zcash_protocol::value::Zatoshis;
-use zingolib::wallet::output::SpendStatus;
+use zingo_netutils::Indexer as _;
 use zingolib::config::{ChainType, ClientConfig, WalletConfig, default_indexer_for};
 use zingolib::data::PollReport;
 use zingolib::lightclient::LightClient;
 use zingolib::wallet::WalletSettings;
 use zingolib::wallet::keys::unified::ReceiverSelection;
+use zingolib::wallet::output::SpendStatus;
 use zingolib::wallet::summary::data::TransactionSummary;
-use zingo_netutils::Indexer as _;
 
-use crate::chain;
 use crate::app::{
-    Action, AddressKind, AddressRow, Balance, Command, InputRow, KeyMaterial, OpenSpec,
-    OutputRole, OutputRow, PoolBalance, SyncNote, Tip,
-    TxRow, WalletData, WalletEntry, WalletEventRow, WalletInfo, WalletKind,
+    Action, AddressKind, AddressRow, Balance, Command, InputRow, KeyMaterial, OpenSpec, OutputRole,
+    OutputRow, PoolBalance, SyncNote, Tip, TxRow, VotingNote, WalletData, WalletEntry,
+    WalletEventRow, WalletInfo, WalletKind,
 };
+use crate::chain;
 
 const RESYNC_INTERVAL: Duration = Duration::from_secs(20);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -97,11 +100,7 @@ impl BackendConfig {
         None
     }
 
-    fn server_uri(
-        &self,
-        name: &str,
-        override_server: Option<&str>,
-    ) -> Result<http::Uri, String> {
+    fn server_uri(&self, name: &str, override_server: Option<&str>) -> Result<http::Uri, String> {
         let raw = override_server
             .map(str::to_string)
             .or_else(|| self.server.clone())
@@ -267,6 +266,15 @@ struct Backend {
     session_pending: bool,
     known_txids: HashSet<String>,
     last: SyncSnapshot,
+    round_id: Option<String>,
+    arm_return: Option<
+        tokio::sync::oneshot::Receiver<(
+            LightClient,
+            Option<zingolib_voting::VotingProgressHandle>,
+        )>,
+    >,
+    voting_handle: Option<zingolib_voting::VotingProgressHandle>,
+    cast_return: Option<tokio::sync::oneshot::Receiver<LightClient>>,
 }
 
 impl Backend {
@@ -283,6 +291,10 @@ impl Backend {
             session_pending: false,
             known_txids: HashSet::new(),
             last: SyncSnapshot::default(),
+            round_id: None,
+            arm_return: None,
+            voting_handle: None,
+            cast_return: None,
         }
     }
 
@@ -492,6 +504,104 @@ impl Backend {
                     lc.clear_proposal().await;
                 }
             }
+            Command::FetchVotingRound => {
+                let result = match self.lc.as_mut() {
+                    Some(lc) => voting::fetch_round(lc).await,
+                    None => Err("no wallet is open".into()),
+                };
+                if let Ok(summary) = &result {
+                    self.round_id = Some(summary.round_id.clone());
+                }
+                self.send(Action::Voting(VotingNote::Round(result)));
+                if let Some(lc) = self.lc.as_ref() {
+                    self.send(Action::Voting(VotingNote::Source(voting::source(lc))));
+                }
+                if let (Some(lc), Some(round_id)) = (self.lc.as_ref(), self.round_id.as_deref()) {
+                    self.send(Action::Voting(VotingNote::JournalLoaded(
+                        voting::journal(lc, round_id).await,
+                    )));
+                }
+                if let Some(lc) = self.lc.as_ref() {
+                    let past = voting::past(lc).await;
+                    self.send(Action::Voting(VotingNote::Past(past)));
+                    let network = voting::network(lc).await;
+                    self.send(Action::Voting(VotingNote::Network(network)));
+                }
+            }
+            Command::FetchPastBallots => {
+                if let Some(lc) = self.lc.as_ref() {
+                    self.send(Action::Voting(VotingNote::Source(voting::source(lc))));
+                    let past = voting::past(lc).await;
+                    self.send(Action::Voting(VotingNote::Past(past)));
+                    let network = voting::network(lc).await;
+                    self.send(Action::Voting(VotingNote::Network(network)));
+                }
+            }
+            Command::FetchRoundTallies(round_id) => {
+                if let Some(lc) = self.lc.as_ref() {
+                    let tallies = voting::round_tallies(lc, &round_id).await;
+                    self.send(Action::Voting(VotingNote::RoundTallies {
+                        round_id,
+                        tallies,
+                    }));
+                }
+            }
+            Command::ArmVoting => match self.lc.take() {
+                Some(lc) => {
+                    let actions = self.actions.clone();
+                    let (returned, received) = tokio::sync::oneshot::channel();
+                    self.arm_return = Some(received);
+                    tokio::spawn(async move {
+                        voting::run_arm(lc, actions, returned).await;
+                    });
+                }
+                None => self.send(Action::Voting(VotingNote::Cast(Err(
+                    "no wallet is open".into()
+                )))),
+            },
+            Command::CastVote(rows) => {
+                if self.voting_handle.is_none() || self.lc.is_none() {
+                    self.send(Action::Voting(VotingNote::Cast(Err(
+                        "no armed voting session".into(),
+                    ))));
+                } else if let (Some(handle), Some(lc)) = (self.voting_handle.take(), self.lc.take())
+                {
+                    let actions = self.actions.clone();
+                    let round_id = self.round_id.clone().unwrap_or_default();
+                    let (returned, received) = tokio::sync::oneshot::channel();
+                    self.cast_return = Some(received);
+                    let decisions = voting::ballot(&rows);
+                    tokio::spawn(async move {
+                        voting::run_cast(lc, handle, actions, round_id, decisions, returned).await;
+                    });
+                }
+            }
+            Command::FetchVotingResults => {
+                let result = match self.lc.as_ref() {
+                    Some(lc) => match self.round_id.as_deref() {
+                        Some(round_id) => voting::results(lc, round_id).await,
+                        None => Err("no round fetched yet".into()),
+                    },
+                    None => Err("no wallet is open".into()),
+                };
+                self.send(Action::Voting(VotingNote::Results(result)));
+            }
+            Command::ClearVotingDecision(proposal_id) => {
+                let result = match self.lc.as_ref() {
+                    Some(lc) => match self.round_id.as_deref() {
+                        Some(round_id) => lc
+                            .clear_voting_decision(round_id, proposal_id)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("no round fetched yet".into()),
+                    },
+                    None => Err("no wallet is open".into()),
+                };
+                match result {
+                    Ok(()) => self.send(Action::Voting(VotingNote::Cleared(proposal_id))),
+                    Err(e) => self.send(Action::Notice(format!("clear failed: {e}"))),
+                }
+            }
             Command::Copy(_) | Command::SaveTheme(_) | Command::ForceQuit => {}
         }
         false
@@ -541,9 +651,9 @@ impl Backend {
                         wallet_settings: wallet_settings(),
                     },
                 };
-                let config =
-                    self.config
-                        .client_config(&name, server_uri.clone(), wallet_config)?;
+                let config = self
+                    .config
+                    .client_config(&name, server_uri.clone(), wallet_config)?;
                 if let Some(server) = &server
                     && let Err(e) = self.config.save_server(&name, server)
                 {
@@ -619,6 +729,21 @@ impl Backend {
     }
 
     async fn on_tick(&mut self) {
+        if let Some(received) = self.arm_return.as_mut()
+            && let Ok((lc, handle)) = received.try_recv()
+        {
+            self.arm_return = None;
+            self.lc = Some(lc);
+            self.voting_handle = handle;
+            self.dirty = true;
+        }
+        if let Some(received) = self.cast_return.as_mut()
+            && let Ok(lc) = received.try_recv()
+        {
+            self.cast_return = None;
+            self.lc = Some(lc);
+            self.dirty = true;
+        }
         let Some(poll) = self.lc.as_mut().map(LightClient::poll_sync) else {
             return;
         };
@@ -773,8 +898,7 @@ async fn fetch_tip(server: http::Uri) -> Result<Tip, String> {
         .get_lightd_info(zingolib::lightclient::DEFAULT_REQUEST_TIMEOUT)
         .await
         .map_err(|e| format!("{server} did not answer: {e}"))?;
-    let height =
-        u32::try_from(info.block_height).map_err(|_| "absurd tip height".to_string())?;
+    let height = u32::try_from(info.block_height).map_err(|_| "absurd tip height".to_string())?;
     let at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -873,10 +997,7 @@ async fn load(lc: &LightClient) -> Result<WalletData, String> {
         .transaction_summaries(false)
         .await
         .map_err(|e| e.to_string())?;
-    let transfers = lc
-        .value_transfers(false)
-        .await
-        .map_err(|e| e.to_string())?;
+    let transfers = lc.value_transfers(false).await.map_err(|e| e.to_string())?;
     let mut by_txid: HashMap<String, Vec<WalletEventRow>> = HashMap::new();
     for transfer in transfers.iter() {
         by_txid
@@ -988,18 +1109,14 @@ async fn output_index(lc: &LightClient) -> OutputIndex {
                 note.scope.to_string(),
             );
             if let Some((spender, pending)) = spend_target(&note.spend_status) {
-                index
-                    .spent_by
-                    .entry(spender)
-                    .or_default()
-                    .push(InputRow {
-                        pool: pool.into(),
-                        value: note.value,
-                        source_txid,
-                        output_index,
-                        memo: note.memo.clone(),
-                        pending,
-                    });
+                index.spent_by.entry(spender).or_default().push(InputRow {
+                    pool: pool.into(),
+                    value: note.value,
+                    source_txid,
+                    output_index,
+                    memo: note.memo.clone(),
+                    pending,
+                });
             }
         }
     }
@@ -1011,18 +1128,14 @@ async fn output_index(lc: &LightClient) -> OutputIndex {
             coin.scope.to_string(),
         );
         if let Some((spender, pending)) = spend_target(&coin.spend_status) {
-            index
-                .spent_by
-                .entry(spender)
-                .or_default()
-                .push(InputRow {
-                    pool: PoolTypeKey::Transparent.into(),
-                    value: coin.value,
-                    source_txid,
-                    output_index,
-                    memo: None,
-                    pending,
-                });
+            index.spent_by.entry(spender).or_default().push(InputRow {
+                pool: PoolTypeKey::Transparent.into(),
+                value: coin.value,
+                source_txid,
+                output_index,
+                memo: None,
+                pending,
+            });
         }
     }
     index

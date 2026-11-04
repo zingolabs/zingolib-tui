@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 zingolib-tui-core = { workspace = true }
 zingolib = { workspace = true }
+zingolib-voting = { workspace = true }
 zingo-netutils = { workspace = true }
 pepper-sync = { workspace = true }
 zingo-status = { workspace = true }
