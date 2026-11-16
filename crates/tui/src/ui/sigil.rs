@@ -29,9 +29,8 @@ pub fn rows(material: &str) -> [String; 4] {
     let map = bitmap(material);
     let mut out: [String; 4] = Default::default();
     for (i, line) in out.iter_mut().enumerate() {
-        for x in 0..8 {
-            let top = map[i * 2][x];
-            let bottom = map[i * 2 + 1][x];
+        let (top_row, bottom_row) = (&map[i * 2], &map[i * 2 + 1]);
+        for (top, bottom) in top_row.iter().zip(bottom_row) {
             line.push(match (top, bottom) {
                 (true, true) => '█',
                 (true, false) => '▀',

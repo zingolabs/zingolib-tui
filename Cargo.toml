@@ -40,6 +40,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 
+# Local override while the pinned-checkpoint support is unpushed; remove
+# once feat/lightclient-voting-api carries it on origin.
+[patch."https://github.com/zingolabs/zingolib"]
+zingolib = { path = "/Users/dorian/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_343myntt9p-1/zingolib/zingolib" }
+pepper-sync = { path = "/Users/dorian/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_343myntt9p-1/zingolib/pepper-sync" }
+zingolib-voting = { path = "/Users/dorian/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_343myntt9p-1/zingolib/zingolib-voting" }
+zingo-netutils = { path = "/Users/dorian/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_343myntt9p-1/zingolib/zingo-netutils" }
+zingo-status = { path = "/Users/dorian/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_343myntt9p-1/zingolib/zingo-status" }
+
 [patch.crates-io]
 # The voting SDK's current lrz build path: branch of the zingolabs fork
 # until a release lands on crates.io.
