@@ -25,6 +25,12 @@ pub struct Cli {
     #[arg(long)]
     pub fake: bool,
 
+    /// Opt the voting screen into the staging vote network. The default
+    /// resolves the production source; `ZINGO_VOTING_STATIC_CONFIG_SOURCE`
+    /// overrides either with a custom URL.
+    #[arg(long)]
+    pub voting_staging: bool,
+
     #[arg(long)]
     pub ascii_qr: bool,
 

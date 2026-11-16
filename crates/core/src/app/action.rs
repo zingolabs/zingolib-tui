@@ -4,6 +4,7 @@ use pepper_sync::sync::ScanRange;
 use pepper_sync::wallet::SyncMode;
 
 use super::state::{KeyMaterial, Tip, WalletData, WalletEntry, WalletInfo};
+use super::voting::{NetworkRoundRow, PastBallotRow, ProposalInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -74,15 +75,14 @@ pub enum Action {
     SeedGenerated(String),
     WalletOpened(WalletInfo),
     OpenFailed(String),
-    SpacingMeasured {
-        spacing_secs: u64,
-    },
+    SpacingMeasured { spacing_secs: u64 },
     DataLoaded(WalletData),
     Sync(SyncNote, Instant),
     Notice(String),
     Copied(bool),
     SendProposed(Result<(u64, u64), String>),
     SendDone(Result<Vec<String>, String>),
+    Voting(VotingNote),
     Shutdown,
 }
 
@@ -122,7 +122,64 @@ pub enum Command {
     },
     ConfirmSend,
     CancelSend,
+    FetchVotingRound,
+    FetchPastBallots,
+    FetchRoundTallies(String),
+    ArmVoting,
+    CastVote(Vec<(u32, Option<u32>)>),
+    FetchVotingResults,
+    ClearVotingDecision(u32),
     SaveTheme(&'static str),
     Quit,
     ForceQuit,
+}
+
+/// One voting event folded into what the reducer needs: either the round
+/// summary arriving, a lifecycle log line, or a stage transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VotingNote {
+    Round(Result<VotingSummary, String>),
+    Event {
+        line: String,
+        stage: Option<VotingStageUpdate>,
+    },
+    Cast(Result<VotingOutcome, String>),
+    JournalLoaded(Vec<(u32, Option<u32>)>),
+    Cleared(u32),
+    Results(Result<Vec<(u32, u32)>, String>),
+    Past(Result<Vec<PastBallotRow>, String>),
+    Network(Result<Vec<NetworkRoundRow>, String>),
+    RoundTallies {
+        round_id: String,
+        tallies: Result<Vec<(u32, String, u64)>, String>,
+    },
+    /// The resolved voting config source, so the UI can always say which
+    /// network the ballots come from.
+    Source(String),
+}
+
+/// The pieces of `ActiveRoundSummary` the screen shows, plain values only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VotingSummary {
+    pub round_id: String,
+    pub snapshot_height: u64,
+    pub vote_end_time_seconds: u64,
+    pub eligible_weight_zatoshi: u64,
+    pub bundle_count: u32,
+    pub proposals: Vec<ProposalInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VotingStageUpdate {
+    Arming,
+    Armed,
+    Casting,
+    Finished,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VotingOutcome {
+    pub all_decided: bool,
+    pub blocking_recovery: bool,
 }
