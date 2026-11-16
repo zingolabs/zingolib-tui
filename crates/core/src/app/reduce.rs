@@ -132,6 +132,14 @@ fn on_voting(state: &mut State, note: VotingNote) -> Vec<Command> {
             if error.contains("NoActiveRound") || error.to_lowercase().contains("no active") {
                 voting.stage = VotingStage::Idle;
                 state.set_notice("no round is open right now - history has past ballots");
+            } else if error.contains("No spend capability")
+                || error.contains("No keys found")
+                || error.contains("wallet error")
+            {
+                voting.stage = VotingStage::Idle;
+                state.set_notice(
+                    "this wallet cannot vote: it needs spending keys - open a seed-backed wallet",
+                );
             } else {
                 voting.stage = VotingStage::Failed(error);
             }
@@ -684,6 +692,12 @@ fn screen_key(state: &mut State, key: Key) -> Vec<Command> {
         }
         Key::Char('v') => {
             state.screen = Screen::Voting;
+            if !state.can_spend() {
+                state.set_notice(
+                    "voting needs a seed-backed wallet - watch-only wallets can watch in Ballots",
+                );
+                return vec![Command::FetchPastBallots];
+            }
             return vec![Command::FetchVotingRound, Command::FetchPastBallots];
         }
         Key::Char('b') => {
@@ -1526,6 +1540,7 @@ mod voting_tests {
 
     pub(super) fn voting_state() -> State {
         let mut s = main_state();
+        s.wallet.as_mut().expect("wallet present").kind = crate::app::state::WalletKind::Seed;
         s.screen = Screen::Voting;
         let _ = reduce(&mut s, Action::Voting(VotingNote::Round(Ok(summary()))));
         s
@@ -1533,7 +1548,8 @@ mod voting_tests {
 
     #[test]
     fn v_key_switches_screen_and_fetches() {
-        let mut s = main_state();
+        let mut s = voting_state();
+        s.screen = Screen::Home;
         let commands = keys(&mut s, &[Key::Char('v')]);
         assert_eq!(s.screen, Screen::Voting);
         assert_eq!(
@@ -1581,6 +1597,33 @@ mod voting_tests {
         let commands = keys(&mut s, &[Key::Up, Key::Enter, Key::Down, Key::Enter]);
         assert_eq!(commands, vec![Command::ArmVoting]);
         assert_eq!(s.voting.stage, VotingStage::Arming);
+    }
+
+    #[test]
+    fn watch_only_wallet_gates_the_voting_screen() {
+        let mut s = main_state();
+        s.wallet.as_mut().expect("wallet present").kind = crate::app::state::WalletKind::Watch;
+        let commands = keys(&mut s, &[Key::Char('v')]);
+        assert_eq!(s.screen, Screen::Voting);
+        assert_eq!(
+            commands,
+            vec![Command::FetchPastBallots],
+            "no round snapshot fetch: a watch-only wallet cannot vote"
+        );
+        assert!(s.notice_text().unwrap().contains("seed-backed wallet"));
+    }
+
+    #[test]
+    fn wallet_key_failure_reads_as_a_voting_limitation() {
+        let mut s = voting_state();
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::Round(Err(
+                "wallet error: No spend capability".into()
+            ))),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Idle);
+        assert!(s.notice_text().unwrap().contains("this wallet cannot vote"));
     }
 
     #[test]

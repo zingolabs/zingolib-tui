@@ -10,12 +10,27 @@ use zip32::AccountId;
 
 use crate::app::action::{VotingNote, VotingOutcome, VotingStageUpdate, VotingSummary};
 
+/// Renders `error` and its whole `source()` chain: the top-level display
+/// alone hides the real cause (e.g. the missing-checkpoint reason under
+/// "wallet error").
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 /// Fetches the active round summary the screen renders.
 pub(super) async fn fetch_round(lc: &mut LightClient) -> Result<VotingSummary, String> {
-    let summary = lc
-        .active_voting_round(AccountId::ZERO)
-        .await
-        .map_err(|e| e.to_string())?;
+    let summary = lc.active_voting_round(AccountId::ZERO).await.map_err(|e| {
+        let chain = error_chain(&e);
+        tracing::warn!("voting round fetch failed: {chain}");
+        chain
+    })?;
     let round = &summary.round;
     Ok(VotingSummary {
         round_id: round.round_id.clone(),
