@@ -132,6 +132,17 @@ fn on_voting(state: &mut State, note: VotingNote) -> Vec<Command> {
             if error.contains("NoActiveRound") || error.to_lowercase().contains("no active") {
                 voting.stage = VotingStage::Idle;
                 state.set_notice("no round is open right now - history has past ballots");
+            } else if let Some(height) = error
+                .split("anchor height ")
+                .nth(1)
+                .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|digits| digits.parse::<u64>().ok())
+            {
+                voting.stage = VotingStage::Idle;
+                state.set_notice(format!(
+                    "this wallet lacks witness data at the round's snapshot {} - keep it synced from before the snapshot, or rescan (Sync screen: R)",
+                    crate::format::group(height)
+                ));
             } else if error.contains("No spend capability")
                 || error.contains("No keys found")
                 || error.contains("wallet error")
@@ -1611,6 +1622,22 @@ mod voting_tests {
             "no round snapshot fetch: a watch-only wallet cannot vote"
         );
         assert!(s.notice_text().unwrap().contains("seed-backed wallet"));
+    }
+
+    #[test]
+    fn missing_snapshot_checkpoint_suggests_a_rescan() {
+        let mut s = voting_state();
+        reduce(
+            &mut s,
+            Action::Voting(VotingNote::Round(Err(
+                "Wallet error.: Ironwood shard store checkpoint not found at anchor height 3578540"
+                    .into(),
+            ))),
+        );
+        assert_eq!(s.voting.stage, VotingStage::Idle);
+        let notice = s.notice_text().unwrap();
+        assert!(notice.contains("3,578,540"));
+        assert!(notice.contains("rescan"));
     }
 
     #[test]
