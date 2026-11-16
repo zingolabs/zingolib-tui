@@ -140,7 +140,7 @@ fn on_voting(state: &mut State, note: VotingNote) -> Vec<Command> {
             {
                 voting.stage = VotingStage::Idle;
                 state.set_notice(format!(
-                    "this wallet lacks witness data at the round's snapshot {} - keep it synced from before the snapshot, or rescan (Sync screen: R)",
+                    "this wallet lacks witness data at the round's snapshot {} - syncing trims old checkpoints, so vote from a wallet that stays synced from before the snapshot",
                     crate::format::group(height)
                 ));
             } else if error.contains("No spend capability")
@@ -1637,7 +1637,7 @@ mod voting_tests {
         assert_eq!(s.voting.stage, VotingStage::Idle);
         let notice = s.notice_text().unwrap();
         assert!(notice.contains("3,578,540"));
-        assert!(notice.contains("rescan"));
+        assert!(notice.contains("trims old checkpoints"));
     }
 
     #[test]
