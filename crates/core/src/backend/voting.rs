@@ -27,7 +27,13 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 /// Fetches the active round summary the screen renders.
 pub(super) async fn fetch_round(lc: &mut LightClient) -> Result<VotingSummary, String> {
     let summary = lc.active_voting_round(AccountId::ZERO).await.map_err(|e| {
-        let chain = error_chain(&e);
+        let mut chain = error_chain(&e);
+        // The birthday settles the "checkpoint not found at anchor height"
+        // case on its own: a wallet whose birthday is past the snapshot
+        // provably had no notes to vote with.
+        if chain.contains("anchor height") {
+            chain.push_str(&format!(" (wallet birthday {})", lc.birthday()));
+        }
         tracing::warn!("voting round fetch failed: {chain}");
         chain
     })?;
