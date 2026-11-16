@@ -112,7 +112,7 @@ pub(super) async fn network(lc: &LightClient) -> Result<Vec<crate::app::NetworkR
             tallies: Vec::new(),
         })
         .collect();
-    rows.sort_by(|a, b| b.end_time.cmp(&a.end_time));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.end_time));
     Ok(rows)
 }
 

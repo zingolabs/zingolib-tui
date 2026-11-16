@@ -783,7 +783,9 @@ impl Fake {
                         confirmed: true,
                     });
                     self.data.txs.insert(0, tx);
-                    self.data.txs.sort_by(|a, b| b.datetime.cmp(&a.datetime));
+                    self.data
+                        .txs
+                        .sort_by_key(|tx| std::cmp::Reverse(tx.datetime));
                     self.send(Action::DataLoaded(self.data.clone()));
                 }
                 if self.scanned >= OUTPUTS {
